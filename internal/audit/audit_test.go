@@ -263,3 +263,30 @@ func TestAnIPv6SourceIsLimitedByItsSlash64AndLoggedByItsAddress(t *testing.T) {
 		t.Fatalf("a sender in another /64 was limited too, or charged with the first one's drops:\n%s", buf.String())
 	}
 }
+
+// An audit record carries its request's ID, once, through the proxy's logger (which adds it from the
+// request's context); a record with no request carries none.
+func TestARecordCarriesItsRequestsID(t *testing.T) {
+	r := httptest.NewRequest("POST", "/token", nil)
+	r = r.WithContext(logging.WithRequestID(r.Context(), "req-1"))
+	for name, tc := range map[string]struct {
+		record func(*Log)
+		want   int
+	}{
+		"a request's record":                  {record: func(l *Log) { l.Record(r, Event{Name: TokenIssued, Outcome: Success}) }, want: 1},
+		"an unauthenticated request's record": {record: func(l *Log) { l.RecordUnauthenticated(r, Event{Name: TokenRejected, Outcome: Failure}) }, want: 1},
+		"no request":                          {record: func(l *Log) { l.Record(nil, Event{Name: KeyLoaded, Outcome: Success}) }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			tc.record(New(logging.New(&buf, "json"), nil, time.Now))
+			if strings.Count(buf.String(), "\n") != 1 {
+				t.Fatalf("want one record: %q", buf.String())
+			}
+			line := buf.String()
+			if strings.Count(line, `"request_id":"req-1"`) != tc.want || strings.Count(line, `"request_id"`) != tc.want {
+				t.Fatalf("want the request ID %d time(s) in one line: %s", tc.want, buf.String())
+			}
+		})
+	}
+}
