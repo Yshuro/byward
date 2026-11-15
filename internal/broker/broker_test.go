@@ -1001,6 +1001,28 @@ func (e *env) noAuditEvent(t *testing.T, name string) {
 	}
 }
 
+// logRecords returns the log records whose msg is msg, in log order.
+func (e *env) logRecords(t *testing.T, msg string) []map[string]any {
+	t.Helper()
+	var recs []map[string]any
+	for _, rec := range logsink.Records[map[string]any](t, e.logs.String()) {
+		if rec["msg"] == msg {
+			recs = append(recs, rec)
+		}
+	}
+	return recs
+}
+
+// fieldIs reports whether rec's key is want; a nil want means key is absent, and a "key":null in the
+// log matches neither.
+func fieldIs(rec map[string]any, key string, want any) bool {
+	got, ok := rec[key]
+	if want == nil {
+		return !ok
+	}
+	return ok && got == want
+}
+
 // auditEvents returns the audit records with the given event name.
 func (e *env) auditEvents(t *testing.T, name string) []map[string]any {
 	t.Helper()
