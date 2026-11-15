@@ -220,10 +220,6 @@ func validate(v *Values, container bool) (*Config, error) {
 	}
 	errs = append(errs, c.upstream(v)...)
 	errs = append(errs, c.tls(v)...)
-	c.UpstreamHeaderTimeout, err = parseHeaderTimeout(v.get("upstream-header-timeout"))
-	if err != nil {
-		errs = append(errs, err)
-	}
 
 	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
 		errs = append(errs, errorf("BYWARD_LISTEN: want host:port, got %q", c.Listen))
@@ -273,7 +269,7 @@ func validate(v *Values, container bool) (*Config, error) {
 	if c.NoAuth && c.PublicURL != nil {
 		errs = append(errs, checkNoAuth(c, v)...)
 	}
-	if c.NoAuth && c.UpstreamCommand != nil {
+	if c.NoAuth && v.stdioUpstream() {
 		c.Relaxations = append(c.Relaxations, "stdio upstream without authentication: anyone who can reach the proxy starts upstream processes, bounded only by BYWARD_STDIO_MAX_PROCESSES, and every process runs as the same anonymous user")
 	}
 	if !c.NoAuth {
