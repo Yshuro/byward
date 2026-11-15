@@ -14,6 +14,7 @@ import (
 
 	"code.dny.dev/ssrf"
 
+	"github.com/byward-dev/byward/internal/testutil/rawanswer"
 	"github.com/byward-dev/byward/internal/testutil/rerun"
 )
 
@@ -221,12 +222,13 @@ func TestResponseHeadersAreCappedAtMaxHeaderBytes(t *testing.T) {
 	}
 }
 
-// A refusal, a status other than 200 and a document over the limit name the URL as logs may show
-// it: no user information, query or fragment.
+// A refusal, a status other than 200, a document over the limit and a refused trailer name the URL
+// as logs may show it (no user information, query or fragment) and quote no line the server sent.
 func TestGetErrorsNameTheURLWithoutItsSecrets(t *testing.T) {
 	big := func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(strings.Repeat("a", 11))) }
 	forbidden := func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusForbidden) }
 	unreached := func(http.ResponseWriter, *http.Request) {} // the guard refuses before any request
+	badTrailer := rawanswer.Handler(rawanswer.RefusedTrailer)
 	for name, tc := range map[string]struct {
 		url  string
 		h    http.HandlerFunc
@@ -236,6 +238,7 @@ func TestGetErrorsNameTheURLWithoutItsSecrets(t *testing.T) {
 		"user information":  {"https://user:SECRET@example.com/doc", unreached, "ssrfguard: refused: https://example.com/doc is not an https URL on port 443"},
 		"another status":    {"https://example.com/doc?code=SECRET#SECRET", forbidden, "ssrfguard: https://example.com/doc answered HTTP status 403"},
 		"larger than limit": {"https://example.com/doc?code=SECRET#SECRET", big, "ssrfguard: response too large: https://example.com/doc is larger than 10 bytes"},
+		"a refused trailer": {"https://example.com/doc?code=SECRET", badTrailer, "ssrfguard: reading https://example.com/doc: a malformed header or trailer line"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := server(t, tc.h, time.Second).Get(context.Background(), tc.url, 10)

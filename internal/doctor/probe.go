@@ -92,7 +92,7 @@ func (p *prober) do(method, target string, body io.Reader, header http.Header) r
 	p.misdHost = p.misdHost || resp.StatusCode == http.StatusMisdirectedRequest
 	b, err := io.ReadAll(io.LimitReader(resp.Body, maxMetadata+1))
 	if err != nil {
-		return response{status: resp.StatusCode, err: err}
+		return response{status: resp.StatusCode, err: logging.BodyError(err)}
 	}
 	if len(b) > maxMetadata {
 		return response{status: resp.StatusCode, err: fmt.Errorf("response is larger than %d bytes", maxMetadata)}
@@ -102,12 +102,12 @@ func (p *prober) do(method, target string, body io.Reader, header http.Header) r
 
 // unreachable is the result for a request that got no response.
 func (p *prober) unreachable(check Check, target string, err error) Result {
-	return check.Result(Fail, "cannot reach "+target+": "+err.Error(), "start the proxy, and check that the public URL's host resolves to it from where doctor runs")
+	return check.Result(Fail, "cannot reach "+logging.URL(target)+": "+err.Error(), "start the proxy, and check that the public URL's host resolves to it from where doctor runs")
 }
 
 // unexpected is the result for a response with the wrong status.
 func (p *prober) unexpected(check Check, target string, r response, want int) Result {
-	res := check.Result(Fail, fmt.Sprintf("%s answered %d, want %d", target, r.status, want), "")
+	res := check.Result(Fail, fmt.Sprintf("%s answered %d, want %d", logging.URL(target), r.status, want), "")
 	switch {
 	case r.status == http.StatusMisdirectedRequest:
 		res.Fix = "the proxy refused the Host header (421): make the reverse proxy in front of it forward the original Host, or add the Host it sends to " + p.t.HostsSetting
@@ -259,13 +259,14 @@ func (p *prober) assertionKeys(target string) Result {
 		return check.Result(Fail, target+" does not name the issuer "+p.t.Issuer+" and a jwks_uri, so a verifier that uses discovery cannot find the assertion keys", "make whatever is in front of the proxy pass this path through unchanged; the proxy's own document has both")
 	}
 	k := p.do(http.MethodGet, doc.JWKSURI, nil, nil)
+	shown := logging.URL(doc.JWKSURI) // what answered may not be the proxy, so the jwks_uri it names is shown as logs may
 	switch {
 	case k.err != nil && k.status == 0:
 		return p.unreachable(check, doc.JWKSURI, k.err)
 	case k.err != nil:
-		return check.Result(Fail, doc.JWKSURI+": "+k.err.Error(), "make whatever is in front of the proxy pass this path through unchanged")
+		return check.Result(Fail, shown+": "+k.err.Error(), "make whatever is in front of the proxy pass this path through unchanged")
 	case k.status != http.StatusOK:
-		return p.unexpected(check, doc.JWKSURI, k, http.StatusOK)
+		return p.unexpected(check, doc.JWKSURI, k, http.StatusOK) // the raw URI is the base a relative redirect resolves against
 	}
 	type jwk struct {
 		KeyID string `json:"kid"`
@@ -274,9 +275,9 @@ func (p *prober) assertionKeys(target string) Result {
 		Keys []jwk `json:"keys"`
 	}
 	if err := json.Unmarshal(k.body, &set); err != nil || !slices.ContainsFunc(set.Keys, func(key jwk) bool { return key.KeyID == p.t.AssertionKeyID }) {
-		return check.Result(Fail, doc.JWKSURI+" does not serve the signing key "+p.t.AssertionKeyID+", so verifiers refuse every assertion", "route /.well-known/jwks.json on this host to the proxy, not to the upstream or another service")
+		return check.Result(Fail, shown+" does not serve the signing key "+p.t.AssertionKeyID+", so verifiers refuse every assertion", "route /.well-known/jwks.json on this host to the proxy, not to the upstream or another service")
 	}
-	return check.Result(Pass, "discovery names "+doc.JWKSURI+", which serves the signing key "+p.t.AssertionKeyID, "")
+	return check.Result(Pass, "discovery names "+shown+", which serves the signing key "+p.t.AssertionKeyID, "")
 }
 
 // redirectTarget is where a redirect points, resolved against target, as logs may show it: a

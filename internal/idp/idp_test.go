@@ -30,6 +30,7 @@ import (
 
 	"github.com/byward-dev/byward/internal/logging"
 	"github.com/byward-dev/byward/internal/testutil/fakeidp"
+	"github.com/byward-dev/byward/internal/testutil/rawanswer"
 )
 
 const secretish = "tok-SECRET-value"
@@ -645,6 +646,23 @@ func TestOnlyThe36CharacterFormIsAGUID(t *testing.T) {
 	} {
 		if got := IsGUID(s); got != want {
 			t.Errorf("IsGUID(%q) = %v, want %v", s, got, want)
+		}
+	}
+}
+
+// A body that ends in a trailer line the transport refuses fails a GET and a token POST without
+// quoting that line, which can hold a cookie or a code.
+func TestARefusedTrailerIsNotQuoted(t *testing.T) {
+	srv := httptest.NewServer(rawanswer.Handler(rawanswer.RefusedTrailer))
+	defer srv.Close()
+	f := NewFetcher(nil)
+	f.Retries = 0
+	var v any
+	getErr := f.GetJSON(context.Background(), srv.URL+"/x", &v)
+	_, postErr := f.PostToken(context.Background(), srv.URL+"/token", url.Values{"code": {"c"}}, nil)
+	for method, err := range map[string]error{"GET": getErr, "POST": postErr} {
+		if err == nil || strings.Contains(err.Error(), "SECRET") || !strings.Contains(err.Error(), "a malformed header or trailer line") {
+			t.Errorf("%s: err = %v, want the refused line named without its text", method, err)
 		}
 	}
 }

@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/byward-dev/byward/internal/envproxy"
@@ -953,4 +954,22 @@ func TestTheRelayReadsTheEnvironmentProxyAndNamesAMisreadOnesCause(t *testing.T)
 			t.Fatalf("child output %q; want the cause as the upstream error only when misread (%v)", got, misread)
 		}
 	})
+}
+
+// A client's request trailer that the server refused fails the relay, and the log names the
+// failure without the line, which the client may have put a token or cookie in.
+func TestAClientsRefusedTrailerIsLoggedWithoutItsLine(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.Copy(io.Discard, r.Body) }))
+	t.Cleanup(up.Close)
+	u, _ := url.Parse(up.URL + "/mcp")
+	var logs bytes.Buffer
+	// The body ends as Go's server ends it when it refuses a trailer line (pinned over a real connection
+	// by logging's TestARealServersRefusedRequestTrailerIsNotQuoted): a bare textproto.ProtocolError.
+	body := io.MultiReader(strings.NewReader("{}"), iotest.ErrReader(textproto.ProtocolError(`malformed MIME header: missing colon: "Cookie session=SECRET"`)))
+	req := httptest.NewRequest(http.MethodPost, "/mcp", body)
+	rec := httptest.NewRecorder()
+	New(slog.New(slog.NewTextHandler(&logs, nil)), u).ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway || strings.Contains(logs.String(), "SECRET") || !strings.Contains(logs.String(), "malformed header or trailer line") {
+		t.Fatalf("status %d, log %q, want 502 and the refused line named without its text", rec.Code, logs.String())
+	}
 }

@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/byward-dev/byward/internal/testutil/rawanswer"
 )
 
 // proxy is a stand-in for the proxy's discovery; each field breaks one thing.
@@ -25,17 +27,25 @@ type proxy struct {
 	noS256         bool
 	htmlMetadata   bool // every metadata document is an HTML page, as a misrouted ingress serves
 	badLocation    bool // everything redirects to a Location the client cannot parse
+	badTrailer     bool // every answer ends in a trailer line the transport refuses
 	// jwksKey, when set, is the key ID the JWKS serves, and the server metadata names jwks_uri.
 	jwksKey   string
 	noJWKSURI bool   // jwks_uri left out although there is a JWKS
 	jwks404   bool   // jwks_uri named, but nothing served there
 	jwksURI   string // overrides the advertised jwks_uri
+	// jwksMoved advertises a jwks_uri logs may not show (an @ in its query), in a directory of its
+	// own, that redirects to a relative Location: it resolves to /jwks/moved only against the
+	// jwks_uri as written.
+	jwksMoved bool
 	hugeJWKS  bool
 	// noOpenIDJWKS leaves jwks_uri out of the OpenID document only, keeping it in RFC 8414's.
 	noOpenIDJWKS bool
 }
 
 func (p proxy) handler(origin string) http.Handler {
+	if p.badTrailer {
+		return rawanswer.Handler(rawanswer.RefusedTrailer)
+	}
 	if p.badLocation {
 		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Location", "http://admin:SECRET/@login.example/x?state=SECRET")
@@ -78,9 +88,12 @@ func (p proxy) handler(origin string) http.Handler {
 		}
 		openIDWithout := p.noOpenIDJWKS && r.URL.Path == "/.well-known/openid-configuration"
 		if p.jwksKey != "" && !p.noJWKSURI && !openIDWithout {
-			doc["jwks_uri"] = origin + "/.well-known/jwks.json"
+			doc["jwks_uri"] = origin + "/.well-known/jwks.json?sig=SECRET" // shown without its query
 			if p.jwksURI != "" {
 				doc["jwks_uri"] = p.jwksURI
+			}
+			if p.jwksMoved {
+				doc["jwks_uri"] = origin + "/jwks/keys.json?u=a@b&sig=SECRET"
 			}
 		}
 		_ = json.NewEncoder(w).Encode(doc)
@@ -106,6 +119,10 @@ func (p proxy) handler(origin string) http.Handler {
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]any{{"kty": "EC", "kid": p.jwksKey}}})
+	})
+	mux.HandleFunc("GET /jwks/keys.json", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", "moved?state=SECRET") // as sent: http.Redirect would make the path absolute
+		w.WriteHeader(http.StatusFound)
 	})
 	mux.HandleFunc("POST /mcp", func(w http.ResponseWriter, r *http.Request) {
 		if p.openMCP {
@@ -269,9 +286,11 @@ func TestSelfProbe404NamesTheRoute(t *testing.T) {
 
 // With an identity assertion, discovery must lead a verifier that uses nothing else to the signing
 // key, as MCP Toolbox's generic auth does: openid-configuration names byward's issuer and a jwks_uri
-// serving the key (ADR-0016 amendment, #207). Without one, the check is not run.
+// serving the key (ADR-0016 amendment, #207). Without one, the check is not run. What answered may not
+// be the proxy, so every result shows the jwks_uri it named as logs may show it, and a redirect from it
+// resolves against the jwks_uri as written.
 func TestSelfProbeFollowsDiscoveryToTheAssertionKey(t *testing.T) {
-	if got := probeSigning(t, proxy{jwksKey: "k1"}, "k1")[keysByDisco]; got.Status != Pass || !strings.Contains(got.Message, "serves the signing key k1") {
+	if got := probeSigning(t, proxy{jwksKey: "k1"}, "k1")[keysByDisco]; got.Status != Pass || !strings.Contains(got.Message, "serves the signing key k1") || strings.Contains(got.Message, "SECRET") {
 		t.Fatalf("healthy: %+v", got)
 	}
 	if _, ran := probe(t, proxy{})[keysByDisco]; ran {
@@ -284,19 +303,21 @@ func TestSelfProbeFollowsDiscoveryToTheAssertionKey(t *testing.T) {
 	}{
 		"no jwks_uri":                          {proxy{jwksKey: "k1", noJWKSURI: true}, "does not name the issuer", "pass this path through unchanged"},
 		"another issuer":                       {proxy{jwksKey: "k1", issuer: "https://other.example"}, "does not name the issuer", "pass this path through unchanged"},
-		"the JWKS is missing":                  {proxy{jwksKey: "k1", jwks404: true}, "answered 404", "route /.well-known/"},
+		"the JWKS is missing":                  {proxy{jwksKey: "k1", jwks404: true}, "/.well-known/jwks.json answered 404", "route /.well-known/"},
 		"another key":                          {proxy{jwksKey: "k0"}, "does not serve the signing key k1", "route /.well-known/jwks.json on this host to the proxy"},
 		"not JSON":                             {proxy{jwksKey: "k1", htmlMetadata: true}, "does not name the issuer", "pass this path through unchanged"},
 		"discovery refused":                    {proxy{jwksKey: "k1", misdirect: true}, "answered 421", "HOSTS_SETTING"},
 		"discovery too large":                  {proxy{jwksKey: "k1", hugeMetadata: true}, "larger than", "pass this path through unchanged"},
 		"the JWKS too large":                   {proxy{jwksKey: "k1", hugeJWKS: true}, "larger than", "pass this path through unchanged"},
 		"jwks_uri only in RFC 8414's document": {proxy{jwksKey: "k1", noOpenIDJWKS: true}, "does not name the issuer", "pass this path through unchanged"},
+		"jwks_uri logs may not show, moved":    {proxy{jwksKey: "k1", jwksMoved: true}, "/jwks/moved)", "pass this path through unchanged"},
 		"jwks_uri unreachable":                 {proxy{jwksKey: "k1", jwksURI: "http://127.0.0.1:1/.well-known/jwks.json"}, "cannot reach http://127.0.0.1:1/.well-known/jwks.json", "start the proxy"},
+		"jwks_uri that does not parse":         {proxy{jwksKey: "k1", jwksURI: "http://admin:SECRET/@x/jwks"}, `cannot reach <invalid URL>: parse "<invalid URL>": not a URL`, "start the proxy"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			got := probeSigning(t, tc.p, "k1")[keysByDisco]
-			if got.Status != Fail || !strings.Contains(got.Message, tc.inMessage) || !strings.Contains(got.Fix, tc.inFix) {
-				t.Fatalf("%+v\nwant fail, message with %q, fix with %q", got, tc.inMessage, tc.inFix)
+			if got.Status != Fail || !strings.Contains(got.Message, tc.inMessage) || !strings.Contains(got.Fix, tc.inFix) || strings.Contains(got.Message+got.Fix, "SECRET") {
+				t.Fatalf("%+v\nwant fail, message with %q, fix with %q, no SECRET", got, tc.inMessage, tc.inFix)
 			}
 		})
 	}
@@ -327,18 +348,29 @@ func TestARedirectTargetIsShownAsLogsMay(t *testing.T) {
 	}
 }
 
-// A redirect to a Location the client cannot parse fails every probe, and no result quotes that
-// Location: the client's own error does, credentials and query included.
-func TestAnUnparsableRedirectIsReportedWithoutItsLocation(t *testing.T) {
-	results := probe(t, proxy{badLocation: true})
-	saw := false
-	for check, r := range results {
-		if strings.Contains(r.Message+r.Fix, "SECRET") {
-			t.Errorf("%s = %+v, quotes the Location", check, r)
-		}
-		saw = saw || strings.Contains(r.Message, "failed to parse Location header")
-	}
-	if !saw {
-		t.Fatalf("no result names the unparsable Location: %+v", results)
+// An answer the client refuses, a redirect to a Location it cannot parse or a trailer line it
+// rejects, is reported by name, and no result quotes what the server sent, though the client's
+// own error does.
+func TestAnAnswerTheClientRefusesIsReportedWithoutQuotingIt(t *testing.T) {
+	for name, tc := range map[string]struct {
+		p     proxy
+		names string // what some result's message calls the failure
+	}{
+		"an unparsable Location": {proxy{badLocation: true}, "failed to parse Location header"},
+		"a refused trailer":      {proxy{badTrailer: true}, "malformed header or trailer line"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			results := probe(t, tc.p)
+			saw := false
+			for check, r := range results {
+				if strings.Contains(r.Message+r.Fix, "SECRET") {
+					t.Errorf("%s = %+v, quotes what the server sent", check, r)
+				}
+				saw = saw || strings.Contains(r.Message, tc.names)
+			}
+			if !saw {
+				t.Fatalf("no result names %q: %+v", tc.names, results)
+			}
+		})
 	}
 }
