@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -138,6 +139,34 @@ func TestChecksRunBeforeAuthentication(t *testing.T) {
 		if res.StatusCode != http.StatusMisdirectedRequest {
 			t.Fatalf("%s host: got %d", p, res.StatusCode)
 		}
+	}
+}
+
+// A browser's preflight from an allowed origin is answered by the Origin check, before the method
+// gate and authentication, its Mcp-Param-* names allowed on top of the fixed ones and nothing else,
+// the answer varying on Origin and Access-Control-Request-Headers; it never reaches the upstream.
+func TestABrowserPreflightIsAnsweredBeforeAuthenticationWithItsMcpParamHeaders(t *testing.T) {
+	e := start(t)
+	preflight := func(requestHeaders string) *http.Response {
+		res := e.do(t, "OPTIONS", "/mcp", nil, map[string]string{"Origin": "https://app.example",
+			"Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": requestHeaders})
+		if res.StatusCode != http.StatusNoContent {
+			t.Fatalf("preflight for %q: status %d, want 204", requestHeaders, res.StatusCode)
+		}
+		return res
+	}
+	// No name requested: the fixed list alone, so a request's names echoed unfiltered cannot hide in it.
+	fixed := preflight("").Header.Values("Access-Control-Allow-Headers")
+	res := preflight("authorization,mcp-param-region")
+	got := res.Header.Values("Access-Control-Allow-Headers")
+	if len(fixed) != 1 || len(got) != 1 || got[0] != fixed[0]+", mcp-param-region" {
+		t.Fatalf("Access-Control-Allow-Headers %q; want the fixed list %q plus mcp-param-region, in one value", got, fixed)
+	}
+	if v := res.Header.Values("Vary"); !slices.Equal(v, []string{"Origin", "Access-Control-Request-Headers"}) {
+		t.Fatalf("Vary %q; want [Origin Access-Control-Request-Headers]", v)
+	}
+	if n := len(e.up.Requests()); n != 0 {
+		t.Fatalf("the preflight reached the upstream (%d requests)", n)
 	}
 }
 
