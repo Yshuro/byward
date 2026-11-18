@@ -46,6 +46,11 @@ type Options struct {
 	// next to the keys; if it is backed up and restored together with the database, restores go
 	// undetected.
 	CounterFile string
+	// MustExist is an operator command's open: the database must already be in Dir with this
+	// binary's schema, or Open fails before it creates the directory, the database or the counter
+	// file: store.ErrNoStore when it is missing or has no schema or Dir is not a directory,
+	// store.ErrOlderSchema or store.ErrNewerSchema at another version. It never migrates.
+	MustExist bool
 }
 
 // Store is the SQLite adapter.
@@ -208,10 +213,18 @@ func within(dir, path string) bool {
 }
 
 // Open opens (creating if needed) the database in opts.Dir, migrates it and checks for a restore.
+// With MustExist it creates no store and never migrates: a missing store, or one at another schema
+// version, fails (Options.MustExist) before anything is created or written.
 func Open(ctx context.Context, opts Options) (*Store, error) {
 	opts, err := opts.validate()
 	if err != nil {
 		return nil, err
+	}
+	path := filepath.Join(opts.Dir, fileName)
+	if opts.MustExist {
+		if err := present(ctx, path); err != nil {
+			return nil, err
+		}
 	}
 	if err := os.MkdirAll(opts.Dir, 0o700); err != nil {
 		return nil, fmt.Errorf("sqlite store: state directory: %w", err)
@@ -219,7 +232,6 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	if err := probeWritable(opts.Dir); err != nil {
 		return nil, err
 	}
-	path := filepath.Join(opts.Dir, fileName)
 	if err := ensureFile(path); err != nil {
 		return nil, err
 	}
@@ -234,7 +246,11 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	s := &Store{db: db, counterFile: opts.CounterFile}
-	if err := migrate(ctx, db); err != nil {
+	prepare := migrate
+	if opts.MustExist {
+		prepare = current
+	}
+	if err := prepare(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -243,6 +259,39 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// present is MustExist's first check, before anything is created or written: the database file is
+// there and holds this binary's schema (sameSchema). It reads the schema version on a plain
+// connection, which sets no journal mode and changes no file mode. A read that fails (an
+// unreadable file, one that is not a database, a read-only directory) is left to the open that
+// follows, which reports it as a proxy start does.
+func present(ctx context.Context, path string) error {
+	switch _, err := os.Stat(path); {
+	case errors.Is(err, os.ErrNotExist):
+		return fmt.Errorf("%w: %s is missing", store.ErrNoStore, fileName)
+	case errors.Is(err, syscall.ENOTDIR):
+		return fmt.Errorf("%w: the state directory, or a directory above it, is not a directory", store.ErrNoStore)
+	case err != nil:
+		return fmt.Errorf("sqlite store: %w", err)
+	}
+	// SQLite would create a WAL database's side files beside a file it cannot write, and could not
+	// remove them; the open that follows reports such a file.
+	f, err := os.OpenFile(path, os.O_RDWR, 0) //nolint:gosec // G304: the configured state directory
+	if err != nil {
+		return nil //nolint:nilerr // the open that follows reports it
+	}
+	_ = f.Close()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return fmt.Errorf("sqlite store: open %s: %w", path, err)
+	}
+	defer func() { _ = db.Close() }()
+	var v int
+	if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
+		return nil //nolint:nilerr // the open that follows reports it
+	}
+	return sameSchema(v)
 }
 
 // Ping checks that the database answers, for the readiness probe (ADR-0021 §10). It waits for the
@@ -264,8 +313,18 @@ func (s *Store) Close() error { return s.db.Close() }
 // one write ahead and the
 // next Open treats the database as restored: users sign in again (fail safe). The single
 // connection and the IMMEDIATE lock order every write, so the mirror follows commit order.
+//
+// ctx ending is not such a failure: a client hanging up, or a shutdown, cancels writes routinely.
+// database/sql rolls a transaction back when its BeginTx context ends, so the transaction runs on
+// a context ctx cannot cancel. ctx still bounds the wait for the connection, fn and the counter
+// update; once the mirror is written, only a failed commit can undo the write.
 func (s *Store) write(ctx context.Context, fn func(*sql.Tx) error) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("sqlite store: begin: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	tx, err := conn.BeginTx(context.WithoutCancel(ctx), nil)
 	if err != nil {
 		return fmt.Errorf("sqlite store: begin: %w", err)
 	}
@@ -278,7 +337,12 @@ func (s *Store) write(ctx context.Context, fn func(*sql.Tx) error) error {
 		_ = tx.Rollback()
 		return fmt.Errorf("sqlite store: write counter: %w", err)
 	}
-	if err := writeCounter(s.counterFile, writes); err != nil {
+	// The last point at which ctx can still decide: ended now, nothing is stored.
+	if err := ctx.Err(); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("sqlite store: write: %w", err)
+	}
+	if err := writeMirror(s.counterFile, writes); err != nil {
 		_ = tx.Rollback()
 		return err
 	}

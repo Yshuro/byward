@@ -28,6 +28,9 @@ working.
 byward revoke-user <user key>
 ```
 
+It prints the store it acted on: check that it is the proxy's. A mistyped setting that points at no
+store is refused with exit code 2, and nothing is created.
+
 It deletes the user's grants and remembered consents and records a cut-off. Their refresh tokens
 stop at once; their access tokens are refused by every proxy using the same store at its next
 revocation-list sync, within seconds. The user key is the `user_key` of the audit stream: with
@@ -88,11 +91,20 @@ clients are never checked: remove one from the [static clients file](../referenc
 and restart instead. An entry that names a static client stops the proxy from starting. The
 setting's full rules are in [DCR settings](dcr.md#settings).
 
-The denylist stops new registrations and sign-ins, and ends what an app already holds:
+The denylist stops new registrations and sign-ins, and ends what an app already holds. An app
+denied by a host is refused through every one of its redirect URIs, not only the one that returns
+to the denied host; a sign-in under way when the entry is added gets no token, since `/token`
+refuses its code and revokes the grant behind it.
 
 - **Its next refresh** is refused and revokes the grant behind the refresh token: 401
   `invalid_client` for a denied CIMD client ID, 400 `invalid_grant` for an app denied by its
-  redirect host.
+  redirect host. A code of its own that it has not redeemed yet, within the code's 60 s, revokes the
+  grant behind it the same way; for a denied CIMD client ID, so does an expired or already redeemed
+  code of its own.
+- **One of its own tokens sent to `/revoke`** ends the grant behind it. A denied CIMD client ID is
+  answered 401 and the grant is revoked with the denylist's reason; an app denied by its redirect
+  host is still found, so it revokes its own token as usual: 200, reason
+  `the client revoked a token (RFC 7009)`.
 - **Its access tokens:**
   - for a denied CIMD client ID, they are refused at the next request;
   - for an app denied by its redirect host, a DCR app always, they keep working until they expire,
@@ -106,9 +118,11 @@ with `revoke-all`. The audit stream's `login` and `token_issued` records carry b
 Audit:
 - a refused DCR registration is `client_registered` with `outcome` `failure` and `reason`
   `invalid_redirect_uri`;
-- a refused `/token` request is `token_rejected` with `reason` `invalid_client` or `invalid_grant`;
-- a revoked grant is `grant_revoked` with `reason` `client on the operator's denylist; grant revoked`
-  and the app's `client_id`.
+- a refused `/token` or `/revoke` request is `token_rejected` with `reason` `invalid_client` or
+  `invalid_grant`;
+- a grant revoked by a refresh, a code redemption as described above, or a denied CIMD client ID's
+  `/revoke` is `grant_revoked` with `reason` `client on the operator's denylist; grant revoked` and
+  the app's `client_id`.
 
 ## An app-only caller
 

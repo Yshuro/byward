@@ -3,6 +3,7 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -11,6 +12,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/byward-dev/byward/internal/logging"
 )
 
 // EnvPrefix starts every environment variable the proxy reads.
@@ -27,6 +30,16 @@ type Setting struct {
 	// Auth marks settings that configure authentication (IdP, broker); --insecure-no-auth refuses
 	// to start when any of them is set, so a half-configured production setup never runs open.
 	Auth bool
+	// URL marks settings whose value is a URL: the proxy uses it whole, but logs and --print-config
+	// show it as logging.MarkedURL does, since a query can hold an API key (#458); doctor's lines
+	// that name one call MarkedURL themselves.
+	URL bool
+	// URLs marks a list setting whose entries can be URLs: logs and --print-config show each URL
+	// entry as logging.MarkedURL does, and any other entry as given.
+	URLs bool
+	// Command marks the setting whose value is a command line: logs and --print-config show its
+	// program and how many arguments follow, never the arguments, since one can be a token.
+	Command bool
 }
 
 // Env is the setting's environment variable name.
@@ -69,12 +82,50 @@ func (v *Values) SecretFiles() []SecretFile {
 	return out
 }
 
-// Display is the value as it may be logged: secrets are always redacted.
+// Display is the value as it may be logged: secrets are always redacted, a URL (or a URL entry of a
+// list) shows its scheme, host and path with a marker for each part left out (logging.MarkedURL),
+// and a command line its program and how many arguments follow (displayCommand).
 func (v Value) Display() string {
-	if v.Setting.Secret && v.Raw != "" {
+	switch {
+	case v.Raw == "":
+		return ""
+	case v.Setting.Secret:
 		return "<redacted>"
+	case v.Setting.URL:
+		return logging.MarkedURL(v.Raw)
+	case v.Setting.URLs:
+		entries := splitList(v.Raw)
+		for i, e := range entries {
+			if strings.Contains(e, "://") {
+				entries[i] = logging.MarkedURL(e)
+			}
+		}
+		return strings.Join(entries, ", ")
+	case v.Setting.Command:
+		return displayCommand(v.Raw)
 	}
 	return v.Raw
+}
+
+// displayCommand is a command line given as a JSON array of strings, shown by its program and the
+// number of arguments left out. A value that is not such an array shows as Hidden.
+func displayCommand(raw string) string {
+	var argv []string
+	if json.Unmarshal([]byte(raw), &argv) != nil || len(argv) == 0 {
+		return logging.Hidden
+	}
+	program := argv[0]
+	if strings.ContainsFunc(program, func(r rune) bool { return !strconv.IsPrint(r) }) { // a newline would start a new line of output
+		program = strconv.Quote(program)
+	}
+	switch n := len(argv) - 1; n {
+	case 0:
+		return program
+	case 1:
+		return program + " (1 argument not shown)"
+	default:
+		return fmt.Sprintf("%s (%d arguments not shown)", program, n)
+	}
 }
 
 // configError is a configuration error; the process exits with its own code for these.
@@ -94,6 +145,30 @@ type Values struct {
 
 // get returns the raw value of a setting.
 func (v *Values) get(name string) string { return v.byKey[name].Raw }
+
+// given reports whether the operator gave the setting: a value, or a file named for a secret, which
+// is given even when it is empty, so it never falls back to another choice. A variable set to nothing
+// is not given here, nor is a _FILE variable set to nothing, which names no file. Other checks may
+// still refuse a variable set to nothing (checkInlineSecrets without --dev; checks that test only
+// Source).
+func (val Value) given() bool { return val.Raw != "" || val.Path != "" }
+
+// given is Value.given for the setting name.
+func (v *Values) given(name string) bool { return v.byKey[name].given() }
+
+// emptySecretFile is the error for a secret setting whose named file holds nothing, or only
+// whitespace, naming the setting as the operator gave it; nil otherwise.
+func (v *Values) emptySecretFile(name string) error {
+	switch val := v.byKey[name]; {
+	case val.Path == "":
+		return nil
+	case val.Raw == "":
+		return errorf("%s: the file is empty", val.From)
+	case strings.TrimSpace(val.Raw) == "":
+		return errorf("%s: the file holds only whitespace", val.From)
+	}
+	return nil
+}
 
 // boolean reads a true/false setting. Every setting read this way must be Bool in the registry, so a
 // bare --name means true (TestBooleanSettingsAreExactlyTheBoolFlags, TestEveryBooleanReadIsOfABoolFlag).
@@ -117,7 +192,8 @@ func (v *Values) Effective() []Value {
 // commandSetting is the setting a command after -- fills, as a JSON array.
 const commandSetting = "upstream-command"
 
-// readFileFunc reads a secret file; main passes os.ReadFile.
+// readFileFunc reads a secret file; main passes os.ReadFile. Its error must be a *fs.PathError or
+// name no path: readSecret shows it through logging.FileError, which removes only that path (#461).
 type readFileFunc = func(path string) ([]byte, error)
 
 // resolve applies flags > env > defaults over a registry. extraFlags registers command-line-only
@@ -155,7 +231,7 @@ func resolve(reg []Setting, args, environ []string, readFile readFileFunc, extra
 		return nil, errorf("%v", err)
 	}
 	if fs.NArg() > 0 {
-		return nil, errorf("unexpected argument %q", fs.Arg(0))
+		return nil, errorf("unexpected argument %s", logging.Quote(fs.Arg(0)))
 	}
 	set := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
@@ -205,12 +281,10 @@ func resolve(reg []Setting, args, environ []string, readFile readFileFunc, extra
 		if len(command) == 0 {
 			return nil, errorf("no command after --")
 		}
-		// Kept as argv, not re-encoded: shown quoted, word by word.
-		quoted := make([]string, len(command))
-		for i, a := range command {
-			quoted[i] = strconv.Quote(a)
-		}
-		v.Raw, v.Source = strings.Join(quoted, " "), SourceFlag
+		// Kept as argv for the upstream; Raw holds it as the env form's JSON array, which Display reads
+		// (a []string always marshals).
+		encoded, _ := json.Marshal(command)
+		v.Raw, v.Source = string(encoded), SourceFlag
 		vals.byKey[commandSetting] = v
 		vals.command = command
 	}
@@ -241,7 +315,8 @@ func readSecret(readFile readFileFunc, path, from string) (string, error) {
 	}
 	b, err := readFile(path)
 	if err != nil {
-		return "", errorf("%s: cannot read secret file: %v", from, err)
+		// The path is not shown: a secret pasted where its file's path belongs would be (#461).
+		return "", errorf("%s: cannot read secret file: %v", from, logging.FileError(err))
 	}
 	return strings.TrimRight(string(b), "\r\n"), nil
 }

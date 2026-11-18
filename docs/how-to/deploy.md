@@ -70,7 +70,8 @@ Set `BYWARD_TRUSTED_PROXIES` to the addresses or CIDRs your reverse proxy connec
 `10.0.0.0/8`. byward then reads the client address from `X-Forwarded-For`
 ([client address](../reference/rate-limits.md#client-address)). Without it, every request seems to
 come from the reverse proxy: all users share one rate-limit budget, and audit records show the
-proxy's address as `remote_ip`. List only proxies you control.
+proxy's address as `remote_ip`. List only proxies you control. A link-local entry (`fe80::/10`) or
+one with a zone (`%eth0`) is refused: give the address the proxy connects from on a routable network.
 
 ## 6. Keep the internal listener private
 
@@ -103,10 +104,13 @@ Secrets are read only from files: the IdP client secret, certificate or key, the
 credential, the stdio upstream's environment file and the PostgreSQL connection string (on `main`)
 each have a `*_FILE` setting. An inline secret refuses to start.
 
-A secret file, the TLS key and each assertion key must be readable by the proxy's user alone:
-mode `0600` or `0400`, owned by uid 65532. A file on a read-only mount passes this check whatever
-its mode, as on a Kubernetes secret volume (`0644` by default) or a Docker mount with `:ro`. Sealing
-key files may be group- or other-readable. No sealing or assertion key file may be world-writable,
+A secret file, the TLS key and each sealing or assertion key must have no permission for its group
+or others: mode `0600` or `0400`, owned by uid 65532. A file on a read-only mount passes this check
+whatever its mode, as on a Kubernetes secret volume (`0644` by default) or a Docker mount with `:ro`.
+On a writable volume the mode counts: a PersistentVolumeClaim in a pod whose `securityContext` sets
+`fsGroup` makes files group-readable, and so does a sidecar that writes keys into an `emptyDir` at
+`0644`. Put such keys on a secret volume, or mount them read-only. No sealing or assertion key file
+may be world-writable,
 and neither may its directory unless it is on a read-only mount
 ([sealing keys](sealing-keys.md#the-key-directory)).
 

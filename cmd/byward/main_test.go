@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -15,9 +17,11 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace/noop"
 
+	"github.com/byward-dev/byward/internal/store/sqlite"
 	"github.com/byward-dev/byward/internal/testutil/assertionkey"
 	"github.com/byward-dev/byward/internal/testutil/closedport"
 	"github.com/byward-dev/byward/internal/testutil/sealingkey"
+	"github.com/byward-dev/byward/internal/tracing"
 )
 
 // serveEnv is what a test run that serves needs besides auth: the URLs, the public listener and an
@@ -112,6 +116,46 @@ func TestPrintConfigShowsSources(t *testing.T) {
 	}
 }
 
+// #458: --print-config and the startup log's config lines show a URL setting without its query, an
+// API key it may hold, and mark the query as left out; the operators who read a query there now see
+// "?…" (security invariant 2).
+func TestAURLSettingsQueryIsNeverPrintedInTheConfiguration(t *testing.T) {
+	const key = "S3CRET-api-key"
+	env := append(authEnv(t), serveEnv("https://m.example/mcp", "127.0.0.1:0")...)
+	env = append(env, "BYWARD_UPSTREAM_URL=http://127.0.0.1:9/mcp?api_key="+key)
+	code, stdout, stderr := runWith([]string{"--print-config"}, env...)
+	if want := "BYWARD_UPSTREAM_URL=http://127.0.0.1:9/mcp?… (env)\n"; code != exitOK || !strings.Contains(stdout, want) || strings.Contains(stdout+stderr, key) {
+		t.Errorf("--print-config: code %d, stdout %q, stderr %q; want the line %q and never the key", code, stdout, stderr, want)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var out, errb bytes.Buffer
+	run(ctx, nil, env, &out, &errb)
+	if want := `"msg":"config","setting":"BYWARD_UPSTREAM_URL","value":"http://127.0.0.1:9/mcp?…","source":"env"}`; !strings.Contains(errb.String(), want) || strings.Contains(errb.String()+out.String(), key) {
+		t.Errorf("startup log %s; want %s and never the key", errb.String(), want)
+	}
+}
+
+// --print-config and the startup log show the stdio upstream's command by its program and how many
+// arguments follow, never the arguments, one of which can be a token; the release note says so.
+func TestTheUpstreamCommandsArgumentsAreNeverPrintedInTheConfiguration(t *testing.T) {
+	const token = "S3CRET-token"
+	env := append(authEnv(t), "BYWARD_PUBLIC_URL=https://m.example/mcp", "BYWARD_LISTEN=127.0.0.1:0", "BYWARD_INTERNAL_LISTEN=127.0.0.1:0",
+		"BYWARD_ASSERTION_KEYS_DIR=") // a stdio upstream takes no assertion keys
+	args := []string{"--", "/bin/cat", "--token", token}
+	code, stdout, stderr := runWith(append([]string{"--print-config"}, args...), env...)
+	if want := "BYWARD_UPSTREAM_COMMAND=/bin/cat (2 arguments not shown) (flag)\n"; code != exitOK || !strings.Contains(stdout, want) || strings.Contains(stdout+stderr, token) {
+		t.Errorf("--print-config: code %d, stdout %q, stderr %q; want the line %q and never the token", code, stdout, stderr, want)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var out, errb bytes.Buffer
+	run(ctx, args, env, &out, &errb)
+	if want := `"msg":"config","setting":"BYWARD_UPSTREAM_COMMAND","value":"/bin/cat (2 arguments not shown)","source":"flag"}`; !strings.Contains(errb.String(), want) || strings.Contains(errb.String()+out.String(), token) {
+		t.Errorf("startup log %s; want %s and never the token", errb.String(), want)
+	}
+}
+
 func TestRunStopsOnCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -125,8 +169,9 @@ func TestRunStopsOnCancelledContext(t *testing.T) {
 // With tracing on, OpenTelemetry's errors reach the proxy's own log at warn level, not stderr as they
 // are: run hands its logger to the tracing setup.
 func TestATracingErrorReachesTheLogAtWarnLevel(t *testing.T) {
-	for _, kv := range os.Environ() { // autoexport and the proxy judgment read the process environment: a developer's settings too
-		if k, _, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "OTEL_") || strings.HasSuffix(strings.ToUpper(k), "_PROXY") {
+	blankOTELEnv(t)
+	for _, kv := range os.Environ() { // the proxy judgment reads the process environment: a developer's settings too
+		if k, _, _ := strings.Cut(kv, "="); strings.HasSuffix(strings.ToUpper(k), "_PROXY") {
 			t.Setenv(k, "")
 		}
 	}
@@ -212,59 +257,141 @@ func TestNoAuthLogsThatAuthIsOffAndTheNextStep(t *testing.T) {
 	}
 }
 
-// The operator commands: a usage mistake exits 2 with nothing on stdout and the store untouched (not
-// even created); a store that cannot open exits 1; a done revocation names the user and exits 0.
-func TestRevokeCommandsExit2OnMisuse1OnAStoreFailureAndReportTheRevokedUser(t *testing.T) {
+// The operator commands: a usage mistake, or a store that is not there (L152), exits 2 with nothing
+// on stdout and nothing created; a store that cannot open exits 1; a done revocation names the user
+// and the store, and exits 0.
+func TestRevokeCommandsExit2OnMisuseOrNoStore1OnAStoreFailureAndNameTheRevokedUserAndStore(t *testing.T) {
 	user := "00000000-0000-0000-0000-00000000000a:11111111-1111-1111-1111-11111111111a"
 	cases := []struct {
 		name       string
 		args       []string
-		badStore   bool // BYWARD_STORE_DIR names a file, so the store cannot open
+		store      operatorStore
 		code       int
 		wantStdout string // "" means nothing at all
 		inStderr   string
 	}{
-		{"revoke-user without a key", []string{"revoke-user"}, false, exitConfig, "", "usage: byward revoke-user <user key>"},
-		{"revoke-user with two keys", []string{"revoke-user", user, user}, false, exitConfig, "", "usage:"},
-		{"revoke-user with an email", []string{"revoke-user", "alice@contoso.example"}, false, exitConfig, "", "not a user key"},
-		{"revoke-all without --yes", []string{"revoke-all"}, false, exitConfig, "", "revoke-all --yes"},
-		{"revoke-all with yes instead of --yes", []string{"revoke-all", "yes"}, false, exitConfig, "", "revoke-all --yes"},
-		{"revoke-all with --yes and more", []string{"revoke-all", "--yes", "extra"}, false, exitConfig, "", "revoke-all --yes"},
-		{"revoke-user with a store that cannot open", []string{"revoke-user", user}, true, exitRuntime, "", "revoke-user failed"},
-		{"revoke-all with a store that cannot open", []string{"revoke-all", "--yes"}, true, exitRuntime, "", "revoke-all failed"},
-		{"revoke-user", []string{"revoke-user", strings.ToUpper(user)}, false, exitOK, "revoked user " + user, `"reason":"operator revoke-user"`},
-		{"revoke-all", []string{"revoke-all", "--yes"}, false, exitOK, "revoked every user", `"reason":"operator revoke-all"`},
+		{"revoke-user without a key", []string{"revoke-user"}, noStore, exitConfig, "", "usage: byward revoke-user <user key>"},
+		{"revoke-user with two keys", []string{"revoke-user", user, user}, noStore, exitConfig, "", "usage:"},
+		{"revoke-user with an email", []string{"revoke-user", "alice@contoso.example"}, noStore, exitConfig, "", "not a user key"},
+		{"revoke-all without --yes", []string{"revoke-all"}, noStore, exitConfig, "", "revoke-all --yes"},
+		{"revoke-all with yes instead of --yes", []string{"revoke-all", "yes"}, noStore, exitConfig, "", "revoke-all --yes"},
+		{"revoke-all with --yes and more", []string{"revoke-all", "--yes", "extra"}, noStore, exitConfig, "", "revoke-all --yes"},
+		{"revoke-user with no store", []string{"revoke-user", user}, noStore, exitConfig, "", "no byward store there: byward.db is missing; run the command with the proxy's settings"},
+		{"revoke-all with no store", []string{"revoke-all", "--yes"}, noStore, exitConfig, "", "no byward store there: byward.db is missing; run the command with the proxy's settings"},
+		{"revoke-all with a state directory that is a file", []string{"revoke-all", "--yes"}, stateDirIsAFile, exitConfig, "", "no byward store there: the state directory, or a directory above it, is not a directory"},
+		{"revoke-user with a store that cannot open", []string{"revoke-user", user}, corruptStore, exitRuntime, "", "revoke-user failed"},
+		{"revoke-all with a store that cannot open", []string{"revoke-all", "--yes"}, corruptStore, exitRuntime, "", "revoke-all failed"},
+		{"revoke-user", []string{"revoke-user", strings.ToUpper(user)}, proxysStore, exitOK, "revoked user " + user + " in BYWARD_STORE_DIR=", `"reason":"operator revoke-user"`},
+		{"revoke-all", []string{"revoke-all", "--yes"}, proxysStore, exitOK, "revoked every user in BYWARD_STORE_DIR=", `"reason":"operator revoke-all"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			env := append(authEnv(t), "BYWARD_PUBLIC_URL=https://m.example/mcp", "BYWARD_UPSTREAM_URL=http://127.0.0.1:9/mcp")
-			var stateDir string
-			for _, kv := range env {
-				if v, ok := strings.CutPrefix(kv, "BYWARD_STORE_DIR="); ok {
-					stateDir = v
-				}
-			}
-			if tc.badStore {
-				if err := os.WriteFile(stateDir, nil, 0o600); err != nil {
-					t.Fatal(err)
-				}
-			}
+			env, stateDir, counter := operatorEnv(t, tc.store)
 			code, stdout, stderr := runWith(tc.args, env...)
 			okStdout := strings.Contains(stdout, tc.wantStdout) && (tc.wantStdout != "" || stdout == "")
 			if code != tc.code || !okStdout || !strings.Contains(stderr, tc.inStderr) {
 				t.Fatalf("code %d (want %d)\nstdout %q (want %q)\nstderr %q (want %q)", code, tc.code, stdout, tc.wantStdout, stderr, tc.inStderr)
 			}
-			if _, err := os.Stat(stateDir); tc.code == exitConfig && !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("a usage mistake touched the store (%v)", err)
+			if tc.code == exitOK {
+				if !strings.Contains(stdout, "BYWARD_STORE_DIR="+stateDir) {
+					t.Fatalf("stdout %q does not name the store %s", stdout, stateDir)
+				}
+				return
+			}
+			created := []string{counter}
+			if tc.store == noStore {
+				created = append(created, stateDir)
+			}
+			for _, p := range created {
+				if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("a refused command created %s (%v)", p, err)
+				}
 			}
 		})
 	}
 }
 
+// L152, ADR-0007 §9: a revocation run with a mistyped state directory, beside the real store's
+// counter file, is refused before it writes anything: the real counter file keeps its value, so
+// restore detection is not weakened, and the mistyped directory is not created.
+func TestARevocationWithAMistypedStateDirectoryLeavesTheRealStoreAlone(t *testing.T) {
+	env, stateDir, counter := operatorEnv(t, proxysStore)
+	// A write past the store's first, so the mirror holds a value a new empty store would not write.
+	if code, _, stderr := runWith([]string{"revoke-all", "--yes"}, env...); code != exitOK {
+		t.Fatalf("revoke-all on the real store: %d %s", code, stderr)
+	}
+	before, err := os.ReadFile(filepath.Clean(counter))
+	if err != nil {
+		t.Fatal(err)
+	}
+	typo := stateDir + "-typo"
+	for i, kv := range env {
+		if strings.HasPrefix(kv, "BYWARD_STORE_DIR=") {
+			env[i] = "BYWARD_STORE_DIR=" + typo
+		}
+	}
+	code, stdout, stderr := runWith([]string{"revoke-all", "--yes"}, env...)
+	if code != exitConfig || stdout != "" || !strings.Contains(stderr, "BYWARD_STORE_DIR="+typo+": no byward store there") {
+		t.Fatalf("code %d (want %d), stdout %q, stderr %q", code, exitConfig, stdout, stderr)
+	}
+	if after, err := os.ReadFile(filepath.Clean(counter)); err != nil || !bytes.Equal(after, before) {
+		t.Fatalf("the real counter file changed: %q, then %q (%v)", before, after, err)
+	}
+	if _, err := os.Stat(typo); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the mistyped state directory was created (%v)", err)
+	}
+}
+
+// operatorStore is what the state directory of an operator command's environment holds.
+type operatorStore int
+
+const (
+	noStore         operatorStore = iota // nothing: the directory does not exist
+	stateDirIsAFile                      // the directory's path is a file
+	corruptStore                         // a byward.db that is not a database
+	proxysStore                          // the store a proxy created
+)
+
+// operatorEnv is a proxy's environment for an operator command, with its state directory and
+// counter file (BYWARD_STORE_COUNTER_FILE, outside the directory), the directory holding st.
+func operatorEnv(t *testing.T, st operatorStore) (env []string, stateDir, counter string) {
+	t.Helper()
+	counter = filepath.Join(t.TempDir(), "store-writes")
+	env = append(authEnv(t), "BYWARD_PUBLIC_URL=https://m.example/mcp", "BYWARD_UPSTREAM_URL=http://127.0.0.1:9/mcp",
+		"BYWARD_STORE_COUNTER_FILE="+counter)
+	for _, kv := range env {
+		if v, ok := strings.CutPrefix(kv, "BYWARD_STORE_DIR="); ok {
+			stateDir = v
+		}
+	}
+	switch st {
+	case stateDirIsAFile:
+		if err := os.WriteFile(stateDir, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	case corruptStore:
+		if err := os.MkdirAll(stateDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(stateDir, "byward.db"), bytes.Repeat([]byte("not a database "), 100), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	case proxysStore:
+		s, err := sqlite.Open(context.Background(), sqlite.Options{Dir: stateDir, CounterFile: counter})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return env, stateDir, counter
+}
+
 func TestHelpListsTheOperatorCommands(t *testing.T) {
 	code, stdout, _ := runWith([]string{"--help"})
-	if code != exitOK || !strings.Contains(stdout, "byward revoke-user <user key>") || !strings.Contains(stdout, "byward revoke-all --yes") ||
-		!strings.Contains(stdout, "byward store new-epoch --yes") {
+	if code != exitOK || !strings.Contains(stdout, "byward revoke-user <user key> [-- stdio-upstream-command [args...]]") || !strings.Contains(stdout, "byward revoke-all --yes [-- stdio-upstream-command [args...]]") ||
+		!strings.Contains(stdout, "byward store new-epoch --yes [-- stdio-upstream-command [args...]]") {
 		t.Fatalf("code=%d help=%q", code, stdout)
 	}
 }
@@ -308,17 +435,128 @@ func TestStoreNewEpochExits2OnMisuseOrSQLiteAnd1WhenPostgreSQLIsUnreachable(t *t
 	}
 }
 
+// revoke-user, revoke-all and store new-epoch take a stdio upstream after "--", as the proxy, check
+// and doctor do, and do not start it (the marker check catches a start that runs before the command
+// returns); a usage mistake before the "--", or SQLite for new-epoch, is still exit 2, with the
+// store untouched.
+func TestRevokeAndNewEpochTakeAStdioUpstreamAfterDashes(t *testing.T) {
+	user := "00000000-0000-0000-0000-00000000000a:11111111-1111-1111-1111-11111111111a"
+	cases := []struct {
+		name     string
+		args     []string
+		code     int
+		inStdout string // "" means nothing at all
+		inStderr string
+	}{
+		{"revoke-user revokes the user", []string{"revoke-user", user, "--"}, exitOK, "revoked user " + user, `"reason":"operator revoke-user"`},
+		{"revoke-all revokes every user", []string{"revoke-all", "--yes", "--"}, exitOK, "revoked every user", `"reason":"operator revoke-all"`},
+		{"store new-epoch refuses SQLite", []string{"store", "new-epoch", "--yes", "--"}, exitConfig, "", "new-epoch is for the PostgreSQL store"},
+		{"revoke-user without a key is a usage error", []string{"revoke-user", "--"}, exitConfig, "", "byward: usage: byward revoke-user <user key> [-- stdio-upstream-command [args...]]"},
+		{"revoke-all without --yes is a usage error", []string{"revoke-all", "--"}, exitConfig, "", "byward: usage: byward revoke-all --yes [-- stdio-upstream-command [args...]] (signs every user out)"},
+		{"store new-epoch without --yes is a usage error", []string{"store", "new-epoch", "--"}, exitConfig, "", "byward: usage: byward store new-epoch --yes [-- stdio-upstream-command [args...]] (refresh tokens from before it stop working)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			script := filepath.Join(dir, "mcp-server")
+			if err := os.WriteFile(script, []byte("#!/bin/sh\ntouch "+dir+"/ran\n"), 0o700); err != nil { //nolint:gosec // G306: an executable test command
+				t.Fatal(err)
+			}
+			env := slices.DeleteFunc(authEnv(t), func(kv string) bool { return strings.HasPrefix(kv, "BYWARD_ASSERTION_KEYS_DIR=") }) // refused with a stdio upstream
+			env = append(env, "BYWARD_PUBLIC_URL=https://m.example/mcp", "BYWARD_DATA_DIR="+dir,                                      // the test's own, so no defaulted path reaches the host's
+				"BYWARD_STORE_COUNTER_FILE="+filepath.Join(dir, "store-writes"))
+			if tc.code == exitOK { // a revocation needs the store a proxy created (L152)
+				s, err := sqlite.Open(context.Background(), sqlite.Options{Dir: setting(env, "BYWARD_STORE_DIR"), CounterFile: setting(env, "BYWARD_STORE_COUNTER_FILE")})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := s.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			code, stdout, stderr := runWith(append(tc.args, script, "--flag"), env...)
+			okStdout := strings.Contains(stdout, tc.inStdout) && (tc.inStdout != "" || stdout == "")
+			if code != tc.code || !okStdout || !strings.Contains(stderr, tc.inStderr) {
+				t.Fatalf("code %d (want %d)\nstdout %q (want %q)\nstderr %q (want %q)", code, tc.code, stdout, tc.inStdout, stderr, tc.inStderr)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "ran")); err == nil {
+				t.Fatal("the command started the stdio upstream")
+			}
+			store := setting(env, "BYWARD_STORE_DIR")
+			if _, err := os.Stat(store); tc.code == exitConfig && !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("a refused command created the store at %s", store)
+			}
+		})
+	}
+}
+
+// setting is the value env gives name, the last one as config reads it; "" when it gives none.
+func setting(env []string, name string) string {
+	v := ""
+	for _, kv := range env {
+		if s, ok := strings.CutPrefix(kv, name+"="); ok {
+			v = s
+		}
+	}
+	return v
+}
+
+// Without authentication the broker's store is off: revoke-user, revoke-all and store new-epoch say
+// so and exit 2, a configuration error, before revoke-user looks for an IdP that is not configured.
+func TestRevokeAndNewEpochWithoutAuthenticationAreAConfigurationError(t *testing.T) {
+	env := []string{"BYWARD_INSECURE_NO_AUTH=true", "BYWARD_PUBLIC_URL=http://127.0.0.1:8080/mcp", "BYWARD_UPSTREAM_URL=http://127.0.0.1:9/mcp"}
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"revoke-user", []string{"revoke-user", "00000000-0000-0000-0000-00000000000a:11111111-1111-1111-1111-11111111111a"}},
+		{"revoke-all", []string{"revoke-all", "--yes"}},
+		{"store new-epoch", []string{"store", "new-epoch", "--yes"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code, stdout, stderr := runWith(tc.args, env...)
+			want := "byward: " + tc.name + ": the broker's store is off with BYWARD_INSECURE_NO_AUTH, so there is nothing to revoke and no store epoch to start"
+			if code != exitConfig || stdout != "" || !strings.Contains(stderr, want) {
+				t.Fatalf("code %d (want %d), stdout %q, stderr %q (want %q)", code, exitConfig, stdout, stderr, want)
+			}
+		})
+	}
+}
+
+// Settings revoke-user cannot build the IdP from (here an Entra certificate file that holds no key)
+// are a configuration error, exit 2, with the line check --offline gives for them, as at startup
+// (ADR-0020 §5, L174); before, revoke-user reported them as a failed revocation, exit 1.
+func TestRevokeUserIsAConfigurationErrorForIdPSettingsStartupRefuses(t *testing.T) {
+	cert := filepath.Join(t.TempDir(), "cert.pem")
+	if err := os.WriteFile(cert, []byte("not a certificate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := append(authEnv(t), "BYWARD_PUBLIC_URL=https://m.example/mcp", "BYWARD_UPSTREAM_URL=http://u/mcp",
+		"BYWARD_ENTRA_CLIENT_SECRET_FILE=", "BYWARD_ENTRA_CLIENT_CERTIFICATE_FILE="+cert)
+	checkCode, _, checkStderr := runWith([]string{"check", "--offline"}, env...)
+	want := lastLine(checkStderr)
+	if checkCode != exitConfig || !strings.HasPrefix(want, "byward: configuration error: BYWARD_ENTRA_CLIENT_CERTIFICATE_FILE: ") {
+		t.Fatalf("check --offline: code %d, stderr %q; the test expects these settings refused as a configuration error", checkCode, checkStderr)
+	}
+	code, stdout, stderr := runWith([]string{"revoke-user", "00000000-0000-0000-0000-00000000000a:11111111-1111-1111-1111-11111111111a"}, env...)
+	if code != exitConfig || stdout != "" || lastLine(stderr) != want {
+		t.Fatalf("revoke-user: code %d (want %d), stdout %q, stderr %q; want the last line %q", code, exitConfig, stdout, stderr, want)
+	}
+}
+
+// lastLine is the last line of out, without its newline.
+func lastLine(out string) string {
+	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	return lines[len(lines)-1]
+}
+
 // An OTEL_TRACES_EXPORTER that autoexport does not know stops the process as a configuration error,
 // on the last line, after the startup log.
 func TestAnUnknownOTELTracesExporterIsAConfigError(t *testing.T) {
 	// Blank the host's OTEL_* so only this test's setting reaches autoexport. autoexport reads the
 	// process environment, while run's getenv reads only the environ it is passed: set the exporter
 	// in both.
-	for _, kv := range os.Environ() {
-		if k, _, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "OTEL_") {
-			t.Setenv(k, "")
-		}
-	}
+	blankOTELEnv(t)
 	t.Setenv("OTEL_TRACES_EXPORTER", "bogus")
 	t.Cleanup(func() {
 		otel.SetErrorHandler(otel.ErrorHandlerFunc(func(error) {}))
@@ -326,10 +564,15 @@ func TestAnUnknownOTELTracesExporterIsAConfigError(t *testing.T) {
 	})
 	env := append(authEnv(t), serveEnv("https://m.example/mcp", "127.0.0.1:0")...)
 	code, _, stderr := runWith(nil, append(env, "OTEL_TRACES_EXPORTER=bogus")...)
-	const want = "byward: configuration error: OTEL_* tracing settings: "
+	// The reason is the exporter's own (tracing.NewExporter's error), as check gives it (L157).
+	_, reason := tracing.NewExporter(context.Background(), os.Getenv, slog.New(slog.DiscardHandler))
+	if reason == nil {
+		t.Fatal("tracing.NewExporter accepts OTEL_TRACES_EXPORTER=bogus; the test expects a refusal")
+	}
+	want := "byward: configuration error: OTEL_* tracing settings: " + reason.Error()
 	lines := strings.Split(strings.TrimSuffix(stderr, "\n"), "\n")
-	if code != exitConfig || !strings.HasSuffix(stderr, "\n") || len(lines) < 2 || !strings.HasPrefix(lines[len(lines)-1], want) {
-		t.Fatalf("code=%d stderr=%q; want exit %d and a last line, after the startup log, starting %q", code, stderr, exitConfig, want)
+	if code != exitConfig || !strings.HasSuffix(stderr, "\n") || len(lines) < 2 || lines[len(lines)-1] != want {
+		t.Fatalf("code=%d stderr=%q; want exit %d and a last line, after the startup log, %q", code, stderr, exitConfig, want)
 	}
 }
 
@@ -341,5 +584,16 @@ func TestAConfigurationErrorIsOneLineNamingTheProgram(t *testing.T) {
 	}
 	if got, want := stderr.String(), "byward: configuration error: BYWARD_X: 100% wrong\n"; got != want {
 		t.Errorf("stderr %q, want %q", got, want)
+	}
+}
+
+// blankOTELEnv blanks every OTEL_* variable for the test: autoexport reads the process environment,
+// a developer's settings too.
+func blankOTELEnv(t *testing.T) {
+	t.Helper()
+	for _, kv := range os.Environ() {
+		if k, _, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "OTEL_") {
+			t.Setenv(k, "")
+		}
 	}
 }

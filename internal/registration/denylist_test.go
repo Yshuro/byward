@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/byward-dev/byward/internal/logging"
 
 	"github.com/byward-dev/byward/internal/store/memory"
 	"github.com/byward-dev/byward/internal/testutil/fakeclock"
@@ -29,6 +32,42 @@ func TestDenylistEntriesAreCIMDClientIDsOrHostNames(t *testing.T) {
 	} {
 		if _, err := NewDenylist([]string{entry}); err == nil || !strings.Contains(err.Error(), why) {
 			t.Errorf("%q: %v, want a refusal mentioning %q", entry, err, why)
+		}
+	}
+}
+
+// A CIMD client ID refused for its user information, query or fragment is named by its scheme, host
+// and path only: the refusal is a startup error, and those parts may hold a credential (security
+// invariant 2). One refused for anything else is named whole when it holds no @, ? or #, and not at
+// all when it does, as logging.Quote decides.
+func TestARefusedDenylistEntryNeverShowsItsUserInformationQueryOrFragment(t *testing.T) {
+	const secret = "s3cretPW"
+	for _, entry := range []string{"https://user:" + secret + "@app.example/c.json", "https://app.example/c.json?token=" + secret,
+		"https://app.example/c.json#" + secret} {
+		_, err := NewDenylist([]string{entry})
+		if err == nil || strings.Contains(err.Error(), secret) || !strings.Contains(err.Error(), `"https://app.example/c.json"`) {
+			t.Errorf("%q: %v, want a refusal naming https://app.example/c.json and not the secret", entry, err)
+		}
+	}
+	for _, entry := range []string{"https://app example/c.json", "https://app.example:abc/c.json"} {
+		if _, err := NewDenylist([]string{entry}); err == nil || !strings.Contains(err.Error(), strconv.Quote(entry)) {
+			t.Errorf("%q: %v, want a refusal naming the entry whole", entry, err)
+		}
+	}
+	if _, err := NewDenylist([]string{"https://app.example:8443/u@x/c.json"}); err == nil || !strings.Contains(err.Error(), logging.Hidden) {
+		t.Errorf("an entry with an @ in its path refused for its port: %v, want it not shown", err)
+	}
+}
+
+// A static client's refused redirect URI is a startup and check error, so it is shown as logs may
+// show it: never its user information, query or fragment (security invariant 2).
+func TestARefusedStaticRedirectURINeverShowsItsCredential(t *testing.T) {
+	const secret = "s3cretPW"
+	for _, uri := range []string{"https://user:" + secret + "@app.example/cb", "https://app.example/cb#" + secret,
+		"http://app.example/cb?token=" + secret} {
+		_, err := load(t, files{"/etc/mcp/clients.json": `{"clients":[{"client_id":"a","token_endpoint_auth_method":"none","redirect_uris":["` + uri + `"]}]}`})
+		if err == nil || strings.Contains(err.Error(), secret) || !strings.Contains(err.Error(), "redirect_uris[0]: redirect URI ") || !strings.Contains(err.Error(), "app.example/cb") {
+			t.Errorf("%s: %v, want it refused, named by scheme, host and path, without the secret", uri, err)
 		}
 	}
 }
@@ -126,23 +165,6 @@ func TestADeniedHostMatchesEverySpellingTheBrowserGoesTo(t *testing.T) {
 	}
 }
 
-// BrowserHost is the ASCII name a browser goes to, the form both the denylist and the consent page
-// compare and show.
-func TestBrowserHostIsTheASCIINameABrowserGoesTo(t *testing.T) {
-	for host, want := range map[string]string{
-		"App.Example.":          "app.example",
-		"BÜCHER.example":        "xn--bcher-kva.example",
-		"ａｐｐ。example":           "app.example",
-		"ｍｙ_app.example":        "my_app.example",
-		"xn--bcher-kva.example": "xn--bcher-kva.example",
-		"127.0.0.1":             "127.0.0.1",
-	} {
-		if got := BrowserHost(host); got != want {
-			t.Errorf("BrowserHost(%q) = %q, want %q", host, got, want)
-		}
-	}
-}
-
 // A denied CIMD client is unknown, with the reason for the operator log, before its document is
 // fetched; another document on the same host still resolves.
 func TestADeniedCIMDClientIsUnknownWithoutAFetch(t *testing.T) {
@@ -202,8 +224,9 @@ func TestACIMDClientReturningToADeniedHostIsRefused(t *testing.T) {
 }
 
 // A CIMD client is denied once any one of its registered redirect URIs returns to a denied host
-// (#338), as the broker sees it: a client from the registry, checked with Denied(). A DCR client
-// shares the check; the broker's refresh tests cover both kinds.
+// (#338), as the broker sees it: a client from the registry, checked with Denied(), and refused as
+// denied for every redirect URI it sends, its allowed ones included. A DCR client shares the check;
+// the broker's refresh tests cover both kinds.
 func TestACIMDClientIsDeniedByAnyOfItsRedirectHosts(t *testing.T) {
 	redirects := []string{"https://app.example/cb", "https://second.example/cb"}
 	for name, tc := range map[string]struct {
@@ -232,6 +255,13 @@ func TestACIMDClientIsDeniedByAnyOfItsRedirectHosts(t *testing.T) {
 			}
 			if got := d.Denied(); got != tc.want {
 				t.Fatalf("Denied() = %v, want %v", got, tc.want)
+			}
+			for _, u := range redirects {
+				var re *RedirectError
+				err := cl.RedirectAllowed(u)
+				if denied := errors.As(err, &re) && re.Reason == ReasonDenied; denied != tc.want || (!tc.want && err != nil) {
+					t.Errorf("RedirectAllowed(%s) = %v, want denied %v", u, err, tc.want)
+				}
 			}
 		})
 	}

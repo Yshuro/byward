@@ -29,7 +29,7 @@ func (c *Config) upstream(v *Values) []error {
 			c.UpstreamStripHeaders = strip
 			errs = append(errs, stripErrs...)
 		}
-		u, err := parseURL("upstream-url", v.get("upstream-url"))
+		u, err := ParseUpstreamURL(v.get("upstream-url"))
 		if err != nil {
 			return append(errs, errorf("%s (or %s, or a command after --)", err.Error(), cmdEnv))
 		}
@@ -45,7 +45,8 @@ func (c *Config) upstream(v *Values) []error {
 		c.UpstreamCommand = nil
 	}
 	if len(c.UpstreamCommand) == 0 || c.UpstreamCommand[0] == "" {
-		errs = append(errs, errorf("%s: want a JSON array of strings whose first element is the program, e.g. [\"/usr/local/bin/server\",\"--flag\"], got %q", cmdEnv, raw))
+		// The value is not shown: a command line can carry a token as an argument.
+		errs = append(errs, errorf("%s: want a JSON array of strings whose first element is the program, e.g. [\"/usr/local/bin/server\",\"--flag\"] (the value given is not shown)", cmdEnv))
 	}
 	env, err := parseEnvLines(v.get("upstream-env"))
 	if err != nil {
@@ -109,7 +110,7 @@ func offModeSettings(v *Values, stdio bool) []error {
 	for _, val := range v.Effective() {
 		s := val.Setting
 		forOff := s.Group == offGroup || stdio && httpOnly[s.Name]
-		if !forOff || val.Source == SourceDefault || val.Raw == "" && val.Path == "" || s.Name == "upstream-url" || s.Name == "upstream-command" || s.Name == "upstream-credential" {
+		if !forOff || val.Source == SourceDefault || !val.given() || s.Name == "upstream-url" || s.Name == "upstream-command" || s.Name == "upstream-credential" {
 			continue
 		}
 		errs = append(errs, errorf("%s is set, but the upstream is %s: it applies only to %s (%s); remove it", spelled(val), inUse, offMode, offSelector))
@@ -194,13 +195,13 @@ const maxUpstreamCredential = 4 << 10
 
 // upstreamCredential reads the operator's upstream credential (ADR-0016 §7): only for an HTTP
 // upstream, a header value without control characters, in a header that is not the assertion's.
-// Errors never contain the value.
+// The credential's errors name it as the operator gave it (spelled), never its value.
 func (c *Config) upstreamCredential(v *Values) []error {
 	fileEnv, hEnv := Setting{Name: "upstream-credential"}.Env()+"_FILE", Setting{Name: "upstream-credential-header"}.Env()
 	val, header := v.byKey["upstream-credential"], v.byKey["upstream-credential-header"]
 	if !v.httpUpstream() { // with stdio the header is an off-mode setting; with no upstream or both, upstream's error says enough
 		if v.stdioUpstream() && val.Source != SourceDefault {
-			return []error{errorf("%s is for an HTTP upstream; give a stdio upstream its credential with BYWARD_UPSTREAM_ENV_FILE", fileEnv)}
+			return []error{errorf("%s is for an HTTP upstream; give a stdio upstream its credential with BYWARD_UPSTREAM_ENV_FILE", spelled(val))}
 		}
 		return nil
 	}
@@ -211,15 +212,19 @@ func (c *Config) upstreamCredential(v *Values) []error {
 		return nil
 	}
 	var errs []error
+	name := spelled(val) // an inline value, accepted under --dev, has no file to name
+	emptyFile := v.emptySecretFile("upstream-credential")
 	switch cred := val.Raw; {
+	case emptyFile != nil:
+		errs = append(errs, emptyFile)
 	case cred == "":
-		errs = append(errs, errorf("%s: the file is empty", val.From))
+		errs = append(errs, errorf("%s is empty", name))
 	case len(cred) > maxUpstreamCredential:
-		errs = append(errs, errorf("%s: the credential is longer than %d bytes", val.From, maxUpstreamCredential))
+		errs = append(errs, errorf("%s: the credential is longer than %d bytes", name, maxUpstreamCredential))
 	case strings.ContainsFunc(cred, func(r rune) bool { return r != '\t' && (r < 0x20 || r == 0x7f) }):
-		errs = append(errs, errorf("%s: the credential must be one header value on one line, without control characters", val.From))
+		errs = append(errs, errorf("%s: the credential must be one header value on one line, without control characters", name))
 	case cred != strings.TrimSpace(cred):
-		errs = append(errs, errorf("%s: the credential starts or ends with white space", val.From))
+		errs = append(errs, errorf("%s: the credential starts or ends with white space", name))
 	default:
 		c.UpstreamCredential = cred
 	}
@@ -246,9 +251,9 @@ func stripHeaders(raw string) ([]string, []error) {
 		h := CanonicalHeader(n)
 		switch {
 		case strings.ContainsRune(n, '*'):
-			errs = append(errs, errorf("%s: %q: exact names only; list each header of a family by name", env, n))
+			errs = append(errs, errorf("%s: %s: exact names only; list each header of a family by name", env, quoteHeaderName(n)))
 		case !httpguts.ValidHeaderFieldName(n):
-			errs = append(errs, errorf("%s: %q is not a header name; list exact names, such as X-Argocd-Base-Url", env, n))
+			errs = append(errs, errorf("%s: %s is not a header name; list exact names, such as X-Argocd-Base-Url", env, quoteHeaderName(n)))
 		case mcpHeaders[h] || strings.HasPrefix(h, MCPParamPrefix):
 			errs = append(errs, errorf("%s: %s is a header MCP needs at the upstream; remove it from the list", env, h))
 		case h == "Traceparent" || h == "Tracestate":

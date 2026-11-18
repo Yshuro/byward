@@ -39,10 +39,13 @@ supply ([Serve TLS at the proxy](tls.md), [ADR-0019](../adr/0019-packaging.md) �
 
 Both checks run before authentication ([ADR-0018](../adr/0018-hardening.md) §1–2).
 
-- [ ] **Host:** the public URL's host is always accepted, and `:80` and `:443` are ignored when
-      comparing. If the ingress sends a different `Host`, such as an internal service name, add it to
-      `BYWARD_ALLOWED_HOSTS`. A mismatch gets `421` and a `host_rejected` audit event. Prefer an
-      ingress that passes the original `Host` through, and keep the list short.
+- [ ] **Host:** the public URL's host is always accepted, and one default port (`:443` or `:80`)
+      is ignored when comparing, as a proxy may add `:80`. An IP address matches in any spelling
+      of the same address, as browsers write it: `127.1` is `127.0.0.1`, and an IPv6 address is
+      compared in its shortest form. If the ingress sends a different
+      `Host`, such as an internal service name, add it to `BYWARD_ALLOWED_HOSTS`. A mismatch gets
+      `421` and a `host_rejected` audit event. Prefer an ingress that passes the original `Host`
+      through, and keep the list short.
 - [ ] **Origin:** browser-based MCP clients send an `Origin`. Only the proxy's own origin and exact
       entries in `BYWARD_ALLOWED_ORIGINS` (`scheme://host[:port]`) pass; anything else gets
       `403` and an `origin_rejected` event. Requests without `Origin` (desktop and CLI clients) pass.
@@ -51,16 +54,16 @@ Both checks run before authentication ([ADR-0018](../adr/0018-hardening.md) §1�
 ## Sealing keys and secret files
 
 - [ ] Create the key directory as in [sealing keys](sealing-keys.md): mode `0700`, one file per key,
-      `openssl rand -base64 32`, owned by the proxy's user (uid 65532 in the image).
+      `(umask 077; openssl rand -base64 32 > …)`, owned by the proxy's user (uid 65532 in the image).
       - The proxy always refuses a world-writable key file, and a world-writable directory unless
         it is on a read-only mount such as a Kubernetes secret volume.
-      - It does **not** refuse group- or other-readable files. Use `0600` (or `0400`) yourself
-        wherever the platform allows.
+      - It refuses a key file with any permission for its group or others, as it does any secret
+        file, unless it is on a read-only mount. Use `0600` (or `0400`).
 - [ ] Create the identity assertion's signing key as in [identity assertion](identity-assertion.md):
       a separate directory, `BYWARD_ASSERTION_KEYS_DIR`, mode `0700`, one PEM P-256 file per key,
-      `0600` and owned by the proxy's user. Unlike sealing keys, a key file other users can read is
-      refused, unless it is on a read-only mount. Like them, a world-writable key file is always
-      refused, and a world-writable directory unless it is on a read-only mount.
+      `0600` and owned by the proxy's user. As for sealing keys, a key file with any permission for
+      its group or others is refused unless it is on a read-only mount. A world-writable key file
+      is always refused, and so is a world-writable directory unless it is on a read-only mount.
 - [ ] Leave `BYWARD_IDENTITY_HEADERS` off unless the upstream cannot verify a JWT. If you turn it
       on, make sure the upstream is reachable through the proxy alone, and run `byward doctor`
       ([plain identity headers](plain-identity-headers.md)).

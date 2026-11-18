@@ -20,6 +20,7 @@ import (
 	"github.com/byward-dev/byward/internal/registration"
 	"github.com/byward-dev/byward/internal/resource"
 	"github.com/byward-dev/byward/internal/store"
+	"github.com/byward-dev/byward/internal/store/memory"
 	"github.com/byward-dev/byward/internal/testutil/fakeidp"
 	"github.com/byward-dev/byward/internal/testutil/sealingkey"
 	"github.com/byward-dev/byward/internal/token"
@@ -393,8 +394,10 @@ func TestStoreOutageAnswers503WithRetryAfter(t *testing.T) {
 	if res.Header.Get("Retry-After") == "" {
 		t.Fatal("503 without Retry-After")
 	}
-	if r := e.revokeToken(t, body["refresh_token"].(string), clientID); r.StatusCode != http.StatusServiceUnavailable || r.Header.Get("Retry-After") == "" {
-		t.Fatalf("revoke during a store outage: %d, want 503 with Retry-After (never a false 200)", r.StatusCode)
+	for _, kind := range []string{"refresh_token", "access_token"} {
+		if r := e.revokeToken(t, body[kind].(string), clientID); r.StatusCode != http.StatusServiceUnavailable || r.Header.Get("Retry-After") == "" {
+			t.Fatalf("revoking the %s during a store outage: %d, want 503 with Retry-After (never a false 200)", kind, r.StatusCode)
+		}
 	}
 }
 
@@ -539,19 +542,28 @@ func TestReuseReportedByTheStoreDeniesAtOnce(t *testing.T) {
 	}
 }
 
+// Revoking either token ends the grant; an expired access token still names its grant.
 func TestRevokeEitherTokenEndsTheGrant(t *testing.T) {
-	for _, which := range []string{"refresh_token", "access_token"} {
-		t.Run(which, func(t *testing.T) {
+	for _, tc := range []struct {
+		name, which string
+		after       time.Duration // how long after the redemption it is revoked
+	}{
+		{"refresh_token", "refresh_token", 0},
+		{"access_token", "access_token", 0},
+		{"expired access_token", "access_token", AccessLifetime + token.Leeway + time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			e := newEnv(t)
 			body := e.offline(t)
-			e.valid(t, body["access_token"].(string)) // syncs the deny list now, so validNow below sees only this replica's own changes
-			if res := e.revokeToken(t, body[which].(string), clientID); res.StatusCode != http.StatusOK || res.Header.Get("Cache-Control") != "no-store" {
-				t.Fatalf("revoke: %d", res.StatusCode)
+			e.now = e.now.Add(tc.after)
+			e.valid(t, body["access_token"].(string)) // syncs the deny list now, so a validNow below sees only this replica's own changes
+			if res := e.revokeToken(t, body[tc.which].(string), clientID); res.StatusCode != http.StatusOK || res.Header.Get("Cache-Control") != "no-store" {
+				t.Fatalf("revoke: %d, Cache-Control %q, want 200 and no-store", res.StatusCode, res.Header.Get("Cache-Control"))
 			}
 			if !e.grantGone(t, firstGrant(e.st)) {
 				t.Fatal("grant survived revocation")
 			}
-			if e.validNow(t, body["access_token"].(string)) {
+			if tc.after < AccessLifetime && e.validNow(t, body["access_token"].(string)) {
 				t.Fatal("the access token still validates on this replica before any sync")
 			}
 			e.oneAuditEvent(t, "grant_revoked", map[string]any{"outcome": "success", "client_id": clientID, "grant_id": firstGrant(e.st),
@@ -564,7 +576,8 @@ func TestRevokeEitherTokenEndsTheGrant(t *testing.T) {
 
 func TestRevokeAnswers200ForWhatIsNotARevocableToken(t *testing.T) {
 	e := newEnv(t)
-	revoked := e.offline(t)["refresh_token"].(string)
+	tokens := e.offline(t)
+	revoked := tokens["refresh_token"].(string)
 	if res := e.revokeToken(t, revoked, clientID); res.StatusCode != http.StatusOK {
 		t.Fatalf("first revoke: %d", res.StatusCode)
 	}
@@ -573,11 +586,54 @@ func TestRevokeAnswers200ForWhatIsNotARevocableToken(t *testing.T) {
 		{"unknown refresh token", token.RefreshPrefix + strings.Repeat("A", 43)},
 		{"malformed access token", token.AccessPrefix + "AAAA"},
 		{"already revoked", revoked},
+		{"access token of a revoked grant", tokens["access_token"].(string)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if res := e.revokeToken(t, tc.tok, clientID); res.StatusCode != http.StatusOK {
 				t.Fatalf("revoke: %d, want 200 (RFC 7009 §2.2)", res.StatusCode)
+			}
+		})
+	}
+}
+
+// A malformed token names no grant, so /revoke answers 200 (RFC 7009 §2.2) even while the store is
+// down: no store read could fail it.
+func TestRevokeAnswers200ForAMalformedTokenEvenWithTheStoreDown(t *testing.T) {
+	e := newEnv(t)
+	e.st.Down(errStoreDown)
+	for _, tok := range []string{token.RefreshPrefix + "AAAA", token.AccessPrefix + "AAAA"} {
+		if res := e.revokeToken(t, tok, clientID); res.StatusCode != http.StatusOK {
+			t.Fatalf("revoking %s with the store down: %d, want 200", tok, res.StatusCode)
+		}
+	}
+}
+
+// A refresh token unused for RefreshIdleLifetime names no grant: /revoke revokes nothing for it,
+// whether the client is found (200) or refused at lookup (401).
+func TestAnIdleExpiredRefreshTokenAtRevokeRevokesNothing(t *testing.T) {
+	found := func(t *testing.T) (e *env, rt, client string, status int) {
+		e = newEnv(t)
+		return e, e.offline(t)["refresh_token"].(string), clientID, http.StatusOK
+	}
+	cases := map[string]func(t *testing.T) (e *env, rt, client string, status int){"a found client": found}
+	for name, newRefusable := range refusals {
+		cases["a client refused at lookup, "+name] = func(t *testing.T) (*env, string, string, int) {
+			c := newRefusable(t)
+			tokens := c.tokens(t, c.signIn(t))
+			c.refuse()
+			return c.e, tokens["refresh_token"].(string), c.d.ClientID, http.StatusUnauthorized
+		}
+	}
+	for name, setUp := range cases {
+		t.Run(name, func(t *testing.T) {
+			e, rt, client, status := setUp(t)
+			e.now = e.now.Add(RefreshIdleLifetime)
+			if res := e.revokeToken(t, rt, client); res.StatusCode != status {
+				t.Fatalf("revoking an idle-expired refresh token: %d, want %d", res.StatusCode, status)
+			}
+			if revocations := e.auditEvents(t, "grant_revoked"); len(revocations) != 0 {
+				t.Fatalf("grant_revoked events %v, want none", revocations)
 			}
 		})
 	}
@@ -799,7 +855,7 @@ func (e *env) rotateKeys(t *testing.T, add, remove []string) {
 			t.Fatal(err)
 		}
 	}
-	ring, err := token.LoadKeyRing(e.keyDir)
+	ring, err := token.LoadKeyRing(e.keyDir, func(string) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -973,14 +1029,15 @@ func TestAccessTokensAreCappedAtTheIdPTokenWhenOnBehalfOfIsOn(t *testing.T) {
 		cap     bool
 		idpLife time.Duration
 		want    time.Duration
+		warning string // the not-capped warning's values at the code exchange (L159); "" for none
 	}{
-		{"on", true, 20 * time.Minute, 20*time.Minute - IdPTokenMargin},
-		{"off", false, 20 * time.Minute, AccessLifetime},
+		{"on", true, 20 * time.Minute, 20*time.Minute - IdPTokenMargin, ""},
+		{"off", false, 20 * time.Minute, AccessLifetime, ""},
 		// Capping at or before now would fail a request whose code or refresh token is spent.
-		{"on, IdP token within the margin", true, 30 * time.Second, AccessLifetime},
+		{"on, IdP token within the margin", true, 30 * time.Second, AccessLifetime, `"idp_token_expires_in":"30s","margin":"1m0s"`},
 		// A cap leaving almost no life would hand out expires_in 0.
-		{"on, IdP token just past the margin", true, IdPTokenMargin + time.Second, AccessLifetime},
-		{"on, the shortest cap", true, IdPTokenMargin + MinCappedLifetime, MinCappedLifetime},
+		{"on, IdP token just past the margin", true, IdPTokenMargin + time.Second, AccessLifetime, `"idp_token_expires_in":"1m1s","margin":"1m0s"`},
+		{"on, the shortest cap", true, IdPTokenMargin + MinCappedLifetime, MinCappedLifetime, ""},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			e := newEnv(t, func(cfg *Config) { cfg.CapAccessToIdPToken = c.cap })
@@ -988,6 +1045,13 @@ func TestAccessTokensAreCappedAtTheIdPTokenWhenOnBehalfOfIsOn(t *testing.T) {
 			body := e.offline(t)
 			if got := body["expires_in"].(float64); got != c.want.Seconds() {
 				t.Fatalf("code exchange: expires_in %v, want %v", got, c.want.Seconds())
+			}
+			const notCapped = "the IdP access token expires too soon to cap the access token to it (within the margin plus the shortest capped lifetime)"
+			switch logs := e.logs.String(); {
+			case c.warning == "" && strings.Contains(logs, notCapped):
+				t.Fatalf("a not-capped warning where the token was capped or the cap is off: %s", logs)
+			case c.warning != "" && (!strings.Contains(logs, notCapped) || !strings.Contains(logs, c.warning)):
+				t.Fatalf("want the not-capped warning with %s, so the operator sees how close it was: %s", c.warning, logs)
 			}
 			e.now = e.now.Add(15 * time.Minute)
 			res, refreshed := e.refresh(t, body["refresh_token"].(string), "")
@@ -1155,6 +1219,54 @@ func TestAClientLookupFailureAtTheCallbackGivesNoRefreshAndWarns(t *testing.T) {
 	if !strings.Contains(e.logs.String(), `"msg":"looking up the client failed, so this grant cannot refresh"`) || !strings.Contains(e.logs.String(), `"client_id":"`+clientID+`"`) {
 		t.Fatalf("no warning naming the client:\n%s", e.logs.String())
 	}
+}
+
+// A stored DCR registration whose redirect URI today's rules refuse fails the lookup at the callback.
+// The warning the operator gets shows that URI as logs may, never its user information or query
+// (security invariant 2, #462).
+func TestAStoredRegistrationRefusedAtTheCallbackIsLoggedWithoutItsUserInformationOrQuery(t *testing.T) {
+	clients, at := memory.New(), time.Unix(1_800_000_000, 0) // the registry's clock, apart from the broker's
+	stored := store.Client{ID: registration.DCRIDPrefix + "stored", CreatedAt: at.Add(-time.Hour), ExpiresAt: at.Add(time.Hour),
+		Metadata: []byte(`{"client_name":"App","redirect_uris":["https://alice:pa55word@app.example/cb?code=s3cret"]}`)}
+	if err := clients.CreateClient(context.Background(), stored, 10); err != nil {
+		t.Fatal(err)
+	}
+	dcr := registration.NewDCRRegistry(registration.DCRConfig{Store: clients, JTI: registration.NewStoreJTICache(memory.New()),
+		Now: func() time.Time { return at }, Scopes: []string{"mcp", "offline_access"}})
+	stale := new(atomic.Bool)
+	e := newEnv(t, func(c *Config) { c.Clients = staleWhen{c.Clients, stale, dcr, stored.ID} })
+	ck, cb := e.startLogin(t, url.Values{"scope": {"mcp offline_access"}})
+	stale.Store(true)
+	res := e.do(t, "GET", "/callback/entra?"+cb.RawQuery, nil, []*http.Cookie{ck})
+	stale.Store(false)
+	if res.StatusCode != http.StatusFound {
+		t.Fatalf("callback: %d, want the redirect to the client", res.StatusCode)
+	}
+	logs := e.logs.String()
+	if !strings.Contains(logs, `"msg":"looking up the client failed, so this grant cannot refresh"`) ||
+		!strings.Contains(logs, "redirect URI https://app.example/cb rejected") {
+		t.Fatalf("no warning naming the refused URI as logs may show it:\n%s", logs)
+	}
+	for _, secret := range []string{"alice", "pa55word", "s3cret"} {
+		if strings.Contains(logs, secret) {
+			t.Fatalf("the log quotes %q:\n%s", secret, logs)
+		}
+	}
+}
+
+// staleWhen is the registry; while stale holds, it answers every lookup as dcr answers for id.
+type staleWhen struct {
+	registration.Registry
+	stale *atomic.Bool
+	dcr   *registration.DCRRegistry
+	id    string
+}
+
+func (s staleWhen) Client(ctx context.Context, id string) (registration.Client, error) {
+	if s.stale.Load() {
+		return s.dcr.Client(ctx, s.id)
+	}
+	return s.Registry.Client(ctx, id)
 }
 
 // downWhen is the registry, unreachable while down holds.

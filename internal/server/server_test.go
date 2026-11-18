@@ -117,6 +117,21 @@ func TestValidTokenIsRelayedWithoutIt(t *testing.T) {
 	}
 }
 
+// An allowed origin given with its scheme's default port admits the Origin header a browser sends
+// for it, which has none (401 is past the origin check, 403 refused there); the forms config stores
+// are TestAllowedOriginsAreStoredAsBrowsersSendThem's.
+func TestAnAllowedOriginAdmitsTheOriginABrowserSends(t *testing.T) {
+	e := start(t, "BYWARD_ALLOWED_ORIGINS=https://App.example.com:443")
+	for origin, want := range map[string]int{
+		"https://app.example.com": 401,
+		"http://app.example.com":  403,
+	} {
+		if res := e.do(t, "POST", "/mcp", nil, map[string]string{"Origin": origin}); res.StatusCode != want {
+			t.Errorf("Origin %s: %d, want %d", origin, res.StatusCode, want)
+		}
+	}
+}
+
 func TestChecksRunBeforeAuthentication(t *testing.T) {
 	e := start(t)
 	// Wrong Origin: 403 even without a token.
@@ -667,6 +682,22 @@ func TestABareIPv6AllowedHostMatchesItsBracketedHostHeaderOnThePublicListener(t 
 		code, _ := getBody(t, s.Public.Handler, host, "/.well-known/oauth-protected-resource/mcp")
 		if wantCode := map[bool]int{true: http.StatusOK, false: http.StatusMisdirectedRequest}[want]; code != wantCode {
 			t.Errorf("Host %s on the public listener: %d, want %d", host, code, wantCode)
+		}
+	}
+}
+
+// #447: the public URL's IPv6 host matches a Host header in any spelling of the address, as a Go
+// client sends what it was given and a browser the canonical form.
+func TestAnIPv6PublicURLMatchesAnySpellingOfItsAddressAndNoOtherHostOnThePublicListener(t *testing.T) {
+	cfg := loadConfig(t, "https://[2001:db8::1]/mcp")
+	s, err := New(cfg, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for host, want := range map[string]int{"[2001:db8::1]": http.StatusOK, "[2001:DB8:0:0::1]": http.StatusOK, "[2001:db8::1]:443": http.StatusOK,
+		"[2001:db8::2]": http.StatusMisdirectedRequest, "evil.example": http.StatusMisdirectedRequest} {
+		if code, _ := getBody(t, s.Public.Handler, host, "/.well-known/oauth-protected-resource/mcp"); code != want {
+			t.Errorf("Host %s on the public listener: %d, want %d", host, code, want)
 		}
 	}
 }

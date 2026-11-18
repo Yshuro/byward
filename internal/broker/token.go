@@ -69,13 +69,13 @@ func (b *Broker) token(w http.ResponseWriter, r *http.Request) {
 
 // authenticateClient finds and authenticates the calling client (ADR-0008 §6), for /token and
 // /revoke. On failure it has already answered: 401 invalid_client, or 503 temporarily_unavailable
-// when a CIMD client's metadata could not be fetched for now (draft -03 §6.1).
+// when a client's metadata or keys could not be fetched for now (draft -03 §6.1) or the proxy's
+// store could not read a DCR registration.
 //
-// onRefused, when set, runs before the 401 with the lookup error if the client was definitely
-// refused: its metadata document (registration.ErrMetadataRefused; never for a transient failure,
-// a disabled CIMD or a host off the allowlist) or its client ID on the operator's denylist
-// (registration.ErrClientDenied). Refresh uses it to revoke what the refused client holds.
-func (b *Broker) authenticateClient(w http.ResponseWriter, r *http.Request, now time.Time, onRefused func(r *http.Request, clientID string, now time.Time, refusal error)) (registration.Client, bool) {
+// onRefused, when set, runs before the 401 with the grant_revoked reason (refusalReason) if the
+// client was definitely refused. Refresh, code redemption and /revoke use it to revoke the grant
+// behind what the refused client presents, when that grant is its own.
+func (b *Broker) authenticateClient(w http.ResponseWriter, r *http.Request, now time.Time, onRefused func(r *http.Request, clientID string, now time.Time, why string)) (registration.Client, bool) {
 	ctx := r.Context()
 	f := r.PostForm
 	clientID := f.Get("client_id")
@@ -95,14 +95,18 @@ func (b *Broker) authenticateClient(w http.ResponseWriter, r *http.Request, now 
 	}
 	client, err := b.cfg.Clients.Client(ctx, clientID)
 	if err != nil {
-		b.clientLookupFailed(ctx, clientID, err)
+		if errors.Is(err, registration.ErrStoreUnavailable) { // a DCR registration could not be read: the store, not the client
+			b.unavailable(w, r, "loading a client registration failed", err)
+			return nil, false
+		}
+		b.clientLookupFailed(ctx, clientID, nil, err)
 		if errors.Is(err, registration.ErrUnavailable) { // draft -03 §6.1: 503 for a transient failure
 			w.Header().Set("Retry-After", cimdRetryAfter)
 			b.tokenFail(w, r, tokenError{http.StatusServiceUnavailable, "temporarily_unavailable", "the client's metadata could not be fetched"})
 			return nil, false
 		}
-		if onRefused != nil && (errors.Is(err, registration.ErrClientDenied) || errors.Is(err, registration.ErrMetadataRefused)) {
-			onRefused(r, clientID, now, err)
+		if why, refused := refusalReason(err); refused && onRefused != nil {
+			onRefused(r, clientID, now, why)
 		}
 		b.tokenFail(w, r, tokenError{http.StatusUnauthorized, "invalid_client", "unknown client"})
 		return nil, false
@@ -113,18 +117,40 @@ func (b *Broker) authenticateClient(w http.ResponseWriter, r *http.Request, now 
 			return nil, false
 		}
 		if errors.Is(err, registration.ErrUnavailable) { // the client's jwks_uri could not be fetched for now
-			b.clientLookupFailed(ctx, clientID, err)
+			b.clientLookupFailed(ctx, clientID, client, err)
 			w.Header().Set("Retry-After", cimdRetryAfter)
 			b.tokenFail(w, r, tokenError{http.StatusServiceUnavailable, "temporarily_unavailable", "the client's keys could not be fetched"})
 			return nil, false
 		}
 		if errors.Is(err, registration.ErrKeysRefused) { // the client's jwks_uri is unusable, not its assertion
-			b.clientLookupFailed(ctx, clientID, err)
+			b.clientLookupFailed(ctx, clientID, client, err)
 		}
 		b.tokenFail(w, r, tokenError{http.StatusUnauthorized, "invalid_client", "client authentication failed"})
 		return nil, false
 	}
 	return client, true
+}
+
+// The grant_revoked reasons for a client the operator denied (by its CIMD client ID at lookup, or
+// by a redirect host once found) or whose CIMD metadata is now definitely refused.
+const (
+	reasonClientDenied    = "client on the operator's denylist; grant revoked"
+	reasonMetadataRefused = "client metadata no longer valid"
+)
+
+// refusalReason reports whether a client lookup error is a definite refusal that ends the grant
+// behind what the client presents when that grant is its own, and the grant_revoked reason: its
+// client ID on the operator's denylist (registration.ErrClientDenied, #338), or its CIMD metadata
+// document refused (registration.ErrMetadataRefused, draft -03 §6.1). It is the one list of such
+// refusals.
+func refusalReason(err error) (why string, refused bool) {
+	switch {
+	case errors.Is(err, registration.ErrClientDenied):
+		return reasonClientDenied, true
+	case errors.Is(err, registration.ErrMetadataRefused):
+		return reasonMetadataRefused, true
+	}
+	return "", false
 }
 
 // redeemCode applies ADR-0008 §6: client ID, exact redirect URI, S256 verifier and client
@@ -133,7 +159,7 @@ func (b *Broker) redeemCode(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	f := r.PostForm
 	now := b.cfg.Now()
-	client, ok := b.authenticateClient(w, r, now, nil)
+	client, ok := b.authenticateClient(w, r, now, b.revokeForRefusedCode)
 	if !ok {
 		return
 	}
@@ -160,6 +186,14 @@ func (b *Broker) redeemCode(w http.ResponseWriter, r *http.Request) {
 		// An outage is not the client's fault: the code may still be good.
 		b.cfg.Log.ErrorContext(ctx, "redeeming an authorization code failed", "error", err)
 		b.tokenFail(w, r, tokenError{http.StatusInternalServerError, "server_error", "the proxy could not redeem the code; try again"})
+		return
+	}
+	// The operator denied the app (ADR-0008 §9, #338) after the user signed in: end the grant as a
+	// refresh does, with the denylist's reason, rather than as a misused code. Only the code's own
+	// client: another client's code is a wrong binding below.
+	if d, ok := client.(redirectDenier); ok && pc.ClientID == client.ID() && d.Denied() {
+		b.revoke(r, client.ID(), claims.GrantID, now, reasonClientDenied)
+		b.tokenFail(w, r, tokenError{http.StatusBadRequest, "invalid_grant", "the authorization code is invalid or expired"})
 		return
 	}
 	// The code is used up now: any binding failure below means it is being misused, so the grant
@@ -241,12 +275,12 @@ func (b *Broker) issue(w http.ResponseWriter, r *http.Request, clientID, grantID
 	if b.cfg.CapAccessToIdPToken && !idpExpiry.IsZero() {
 		// On-Behalf-Of presents the stored IdP token; an access token that outlived it would reach
 		// the upstream without a downstream token (ADR-0017 amendment 2026-11-07).
-		// An IdP token that ends within the margin is not a cap: the code or refresh token is
+		// An IdP token that ends within the margin plus MinCappedLifetime is not a cap: the code or refresh token is
 		// already spent, so failing here would strand the client; On-Behalf-Of refuses instead.
 		if capped := idpExpiry.Add(-IdPTokenMargin); !capped.Before(now.Add(MinCappedLifetime)) {
 			exp = minTime(exp, capped)
 		} else {
-			b.cfg.Log.WarnContext(ctx, "the IdP access token expires within the margin; the access token is not capped to it", "idp_token_expires_in", idpExpiry.Sub(now).String(), "margin", IdPTokenMargin.String())
+			b.cfg.Log.WarnContext(ctx, "the IdP access token expires too soon to cap the access token to it (within the margin plus the shortest capped lifetime)", "idp_token_expires_in", idpExpiry.Sub(now).String(), "margin", IdPTokenMargin.String())
 		}
 	}
 	c := token.Claims{GrantID: grantID, Subject: subject, IssuedAt: now, ExpiresAt: exp, ClientID: clientID, Claims: resource.Claims(asserted)}
@@ -302,6 +336,23 @@ func assertionSubject(jwt string) string {
 		return ""
 	}
 	return c.Sub
+}
+
+// revokeForRefusedCode revokes, with why, the grant behind the code a client refused at lookup
+// (refusalReason) presents. Without it an unspent code would outlive the refusal and redeem once
+// the lookup succeeds again within its lifetime; a spent or expired code of its own ends the grant
+// it stands for too. Only the code's own client's grant is revoked, as refresh does; the grant is
+// read, not the code consumed, so another client's code is left to its own redemption.
+func (b *Broker) revokeForRefusedCode(r *http.Request, clientID string, now time.Time, why string) {
+	claims, err := b.cfg.Sealer.Open(token.Code, r.PostForm.Get("code"))
+	if err != nil {
+		return
+	}
+	g, err := b.cfg.Store.Grant(r.Context(), claims.GrantID)
+	if err != nil || g.ClientID != clientID {
+		return
+	}
+	b.revoke(r, clientID, g.ID, now, why)
 }
 
 // revoke ends a grant (store and deny list) and logs why, on one line with attrs. A store failure is

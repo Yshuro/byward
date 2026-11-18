@@ -1,7 +1,11 @@
 package config
 
 import (
+	"net/url"
+	"strconv"
 	"strings"
+
+	"github.com/byward-dev/byward/internal/logging"
 )
 
 // clientSources reads the client sources besides the static file: Dynamic Client Registration with
@@ -19,16 +23,39 @@ func (c *Config) clientSources(v *Values) []error {
 		}
 		for _, e := range c.ClientDenylist {
 			if strings.HasPrefix(e, "https://") {
-				continue // a CIMD client ID, which registration.NewDenylist checks
+				// A CIMD client ID, which registration.NewDenylist checks in full. Config refuses here,
+				// before the startup log lists the settings, only the forms that can carry a credential:
+				// a user name or password, a query or fragment, or no URL at all with an @ in it
+				// (security invariant 2). The rest stays registration's rule.
+				switch u, err := url.Parse(e); {
+				case err == nil && u.User != nil:
+					errs = append(errs, errorf("%s: %s is not a CIMD client ID: it has a user name or password", env, logging.Quote(e)))
+				case strings.ContainsAny(e, "?#"):
+					errs = append(errs, errorf("%s: %s is not a CIMD client ID: it has a query or a fragment", env, logging.Quote(e)))
+				case err != nil && strings.Contains(e, "@"):
+					errs = append(errs, errorf("%s: %s is not a CIMD client ID: it is not an absolute URL", env, logging.Quote(e)))
+				}
+				continue
 			}
 			// A trailing dot names the same host; registration.BrowserHost folds it away.
 			host := strings.TrimSuffix(e, ".")
-			if err := asciiHost(e); err != nil {
+			// A refused entry is quoted as logging.Quote does; one that is a URL in all but its scheme's
+			// case (HTTPS://…) as MarkedURL shows it, so the message marks with ;… ?… #… what it leaves out.
+			shown := logging.Quote(e)
+			if strings.Contains(e, "://") {
+				if shown = logging.MarkedURL(e); shown != logging.Hidden {
+					shown = strconv.Quote(shown)
+				}
+			}
+			if err := asciiHost(e); err != nil && strings.Contains(e, "://") {
+				// asciiHost's message, with the entry shown as MarkedURL shows it (#458).
+				errs = append(errs, errorf("%s: %s has a host that is not ASCII; give its ASCII (xn--) form, which is what browsers and MCP clients send", env, shown))
+			} else if err != nil {
 				errs = append(errs, errorf("%s: %v", env, err))
 			} else if reason := hostNameReason(host); reason != "" {
-				errs = append(errs, errorf("%s: %q is neither a CIMD client ID (an https URL) nor a host name such as app.example: %s", env, e, reason))
+				errs = append(errs, errorf("%s: %s is neither a CIMD client ID (an https URL) nor a host name such as app.example: %s", env, shown, reason))
 			} else if endsInANumber(host) {
-				errs = append(errs, errorf("%s: %q ends in a number, so a browser reads it as an IPv4 address: one it also reaches by other spellings (127.1, 0x7f000001) that no entry can match (127.1 and 0x7f000001 are 127.0.0.1), or none at all; deny the app by its CIMD client ID or its redirect host's name", env, e))
+				errs = append(errs, errorf("%s: %s ends in a number, so a browser reads it as an IPv4 address: one it also reaches by other spellings (127.1, 0x7f000001) that no entry can match (127.1 and 0x7f000001 are 127.0.0.1), or none at all; deny the app by its CIMD client ID or its redirect host's name", env, shown))
 			}
 		}
 	}
@@ -51,7 +78,7 @@ func (c *Config) clientSources(v *Values) []error {
 			if err := asciiHost(h); err != nil {
 				errs = append(errs, errorf("%s: %v", env, err))
 			} else if reason := hostNameReason(h); reason != "" {
-				errs = append(errs, errorf("%s: %q is not a host name such as claude.ai: %s", env, h, reason))
+				errs = append(errs, errorf("%s: %s is not a host name such as claude.ai: %s", env, logging.Quote(h), reason))
 			}
 			(*s.dst)[i] = strings.ToLower(h)
 		}
@@ -70,15 +97,4 @@ func hostNameReason(h string) string {
 		return "give a name with at least one dot"
 	}
 	return ""
-}
-
-// endsInANumber reports whether a browser reads host as an IPv4 address (WHATWG URL "ends in a
-// number"): its last label is decimal digits, or 0x and hex digits. The parse may then fail (a.0x7f),
-// and the browser refuses the URL.
-func endsInANumber(host string) bool {
-	last := host[strings.LastIndex(host, ".")+1:]
-	if hex, ok := strings.CutPrefix(strings.ToLower(last), "0x"); ok {
-		return strings.Trim(hex, "0123456789abcdef") == ""
-	}
-	return last != "" && strings.Trim(last, "0123456789") == ""
 }

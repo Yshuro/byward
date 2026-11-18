@@ -3,12 +3,16 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/byward-dev/byward/internal/logging"
 )
 
 // base is the Entra quickstart: the only settings an operator must set (ADR-0020 §8).
@@ -110,9 +114,29 @@ func TestInvalidSettingsAreRejectedNamingTheSetting(t *testing.T) {
 		// Browsers and MCP clients send IDN hosts in ASCII (xn--) form, so a Unicode host never matches.
 		{"unicode public host", "BYWARD_PUBLIC_URL=https://bücher.example/mcp", `BYWARD_PUBLIC_URL: the host "bücher.example" is not ASCII`},
 		{"escaped unicode public host", "BYWARD_PUBLIC_URL=https://b%C3%BCcher.example/mcp", `BYWARD_PUBLIC_URL: the host "bücher.example" is not ASCII`},
-		{"unicode allowed origin", "BYWARD_ALLOWED_ORIGINS=https://bücher.example", `BYWARD_ALLOWED_ORIGINS: the host "bücher.example" is not ASCII`},
+		{"unicode allowed origin", "BYWARD_ALLOWED_ORIGINS=https://bücher.example", `BYWARD_ALLOWED_ORIGINS: "https://bücher.example": the host "bücher.example" is not ASCII`},
+		{"origin with a leading-zero port", "BYWARD_ALLOWED_ORIGINS=https://app.example.com:0443", `BYWARD_ALLOWED_ORIGINS: "https://app.example.com:0443": "app.example.com:0443" is not a host[:port]`},
+		{"origin with a port over 65535", "BYWARD_ALLOWED_ORIGINS=https://app.example.com:99999", `BYWARD_ALLOWED_ORIGINS: "https://app.example.com:99999": "app.example.com:99999" is not a host[:port]`},
+		{"origin with port 0", "BYWARD_ALLOWED_ORIGINS=https://app.example.com:0", `BYWARD_ALLOWED_ORIGINS: "https://app.example.com:0": "app.example.com:0" is not a host[:port]`},
+		{"origin with an empty port", "BYWARD_ALLOWED_ORIGINS=https://app.example.com:", `BYWARD_ALLOWED_ORIGINS: "https://app.example.com:": "app.example.com:" is not a host[:port]`},
+		{"origin with an empty label", "BYWARD_ALLOWED_ORIGINS=https://a..b", `BYWARD_ALLOWED_ORIGINS: "https://a..b": "a..b" is not a host[:port]: a host name`},
+		{"origin with a leading dot", "BYWARD_ALLOWED_ORIGINS=https://.app.example.com", `BYWARD_ALLOWED_ORIGINS: "https://.app.example.com": ".app.example.com" is not a host[:port]: a host name`},
+		{"origin with a trailing dot", "BYWARD_ALLOWED_ORIGINS=https://app.example.com.", `BYWARD_ALLOWED_ORIGINS: "https://app.example.com.": "app.example.com." is not a host[:port]: a host name`},
+		{"origin with an IPv6 zone", "BYWARD_ALLOWED_ORIGINS=https://[fe80::1%25eth0]", `BYWARD_ALLOWED_ORIGINS: "https://[fe80::1%25eth0]": "[fe80::1%eth0]" is not a host[:port]`},
+		{"origin with a shortened IPv4 address", "BYWARD_ALLOWED_ORIGINS=https://127.1", `BYWARD_ALLOWED_ORIGINS: "https://127.1": "127.1" is not an IPv4 address in dotted decimal, the only form browsers send`},
+		{"origin ending in an upper-case hex label", "BYWARD_ALLOWED_ORIGINS=https://192.168.0.0xFF", `BYWARD_ALLOWED_ORIGINS: "https://192.168.0.0xFF": "192.168.0.0xFF" is not an IPv4 address in dotted decimal`},
+		{"origin with an IPv4 part over 255", "BYWARD_ALLOWED_ORIGINS=https://10.0.0.999", `BYWARD_ALLOWED_ORIGINS: "https://10.0.0.999": "10.0.0.999" is not an IPv4 address in dotted decimal`},
+		{"origin with user info", "BYWARD_ALLOWED_ORIGINS=https://user@app.example.com", `is not an origin (scheme://host[:port]): it has a user name or password`},
+		{"origin that is not a URL", "BYWARD_ALLOWED_ORIGINS=https://[::1", `BYWARD_ALLOWED_ORIGINS: "https://[::1" is not an origin`},
+		{"origin ending in a hex label of every hex digit", "BYWARD_ALLOWED_ORIGINS=https://a.0x0123456789abcdef", `BYWARD_ALLOWED_ORIGINS: "https://a.0x0123456789abcdef": "a.0x0123456789abcdef" is not an IPv4 address in dotted decimal`},
+		{"origin ending in a bare 0", "BYWARD_ALLOWED_ORIGINS=https://a.0", `BYWARD_ALLOWED_ORIGINS: "https://a.0": "a.0" is not an IPv4 address in dotted decimal`},
+		{"origin ending in a bare 0x", "BYWARD_ALLOWED_ORIGINS=https://a.0x", `BYWARD_ALLOWED_ORIGINS: "https://a.0x": "a.0x" is not an IPv4 address in dotted decimal`},
+		{"origin ending in a label of every digit", "BYWARD_ALLOWED_ORIGINS=https://a.1234567890", `BYWARD_ALLOWED_ORIGINS: "https://a.1234567890": "a.1234567890" is not an IPv4 address in dotted decimal`},
+		{"origin with a shortened IPv4 address and a port", "BYWARD_ALLOWED_ORIGINS=http://127.1:8080", `BYWARD_ALLOWED_ORIGINS: "http://127.1:8080": "127.1" is not an IPv4 address in dotted decimal`},
+		{"origin with a hex IPv4 label", "BYWARD_ALLOWED_ORIGINS=https://0x7f.0.0.1", `BYWARD_ALLOWED_ORIGINS: "https://0x7f.0.0.1": "0x7f.0.0.1" is not an IPv4 address in dotted decimal`},
+		{"origin with a fragment", "BYWARD_ALLOWED_ORIGINS=https://app.example.com#", `is not an origin (scheme://host[:port]): it has a query or a fragment`},
+		{"origin with an empty query", "BYWARD_ALLOWED_ORIGINS=https://app.example.com?", `is not an origin (scheme://host[:port]): it has a query or a fragment`},
 		{"unicode allowed host", "BYWARD_ALLOWED_HOSTS=bücher.example:8443", `BYWARD_ALLOWED_HOSTS: the host "bücher.example:8443" is not ASCII`},
-		{"credentials", "BYWARD_UPSTREAM_URL=http://u:p@upstream/mcp", "BYWARD_UPSTREAM_URL"},
 		{"origin with path", "BYWARD_ALLOWED_ORIGINS=https://a.example/path", "BYWARD_ALLOWED_ORIGINS"},
 		{"host with path", "BYWARD_ALLOWED_HOSTS=a.example/x", `BYWARD_ALLOWED_HOSTS: "a.example/x" is not a host[:port]: give host`},
 		{"host with space", "BYWARD_ALLOWED_HOSTS=a b", `BYWARD_ALLOWED_HOSTS: "a b" is not a host[:port]: give host`},
@@ -122,9 +146,9 @@ func TestInvalidSettingsAreRejectedNamingTheSetting(t *testing.T) {
 		{"unclosed bracket", "BYWARD_ALLOWED_HOSTS=[::1", `BYWARD_ALLOWED_HOSTS: "[::1" is not a host[:port]`},
 		{"name with a closing bracket", "BYWARD_ALLOWED_HOSTS=mcp.example]", `BYWARD_ALLOWED_HOSTS: "mcp.example]" is not a host[:port]: give host`},
 		{"name with an opening bracket", "BYWARD_ALLOWED_HOSTS=mcp.example[", `BYWARD_ALLOWED_HOSTS: "mcp.example[" is not a host[:port]: give host`},
-		{"name with user info", "BYWARD_ALLOWED_HOSTS=a@b", `BYWARD_ALLOWED_HOSTS: "a@b" is not a host[:port]: a host name has only letters, digits and - . _ ~`},
-		{"name with a query", "BYWARD_ALLOWED_HOSTS=a?b", `BYWARD_ALLOWED_HOSTS: "a?b" is not a host[:port]: a host name`},
-		{"name with a fragment", "BYWARD_ALLOWED_HOSTS=a#b", `BYWARD_ALLOWED_HOSTS: "a#b" is not a host[:port]: a host name`},
+		{"name with user info", "BYWARD_ALLOWED_HOSTS=a@b", "BYWARD_ALLOWED_HOSTS: " + logging.Hidden + ` is not a host[:port]: a host name has only letters, digits and - . _ ~`},
+		{"name with a query", "BYWARD_ALLOWED_HOSTS=a?b", "BYWARD_ALLOWED_HOSTS: " + logging.Hidden + ` is not a host[:port]: a host name`},
+		{"name with a fragment", "BYWARD_ALLOWED_HOSTS=a#b", "BYWARD_ALLOWED_HOSTS: " + logging.Hidden + ` is not a host[:port]: a host name`},
 		{"name with a backslash", "BYWARD_ALLOWED_HOSTS=a\\b", `BYWARD_ALLOWED_HOSTS: "a\\b" is not a host[:port]: a host name`},
 		{"name with a semicolon", "BYWARD_ALLOWED_HOSTS=a;b", `BYWARD_ALLOWED_HOSTS: "a;b" is not a host[:port]: a host name`},
 		{"name with a tab", "BYWARD_ALLOWED_HOSTS=a\tb", `BYWARD_ALLOWED_HOSTS: "a\tb" is not a host[:port]: a host name`},
@@ -156,10 +180,10 @@ func TestInvalidSettingsAreRejectedNamingTheSetting(t *testing.T) {
 		{"cimd allowed hosts blank", "BYWARD_CIMD_ALLOWED_HOSTS=,", "BYWARD_CIMD_ALLOWED_HOSTS is set but lists nothing"},
 		{"cimd host with a scheme", "BYWARD_CIMD_TRUSTED_HOSTS=https://claude.ai", `BYWARD_CIMD_TRUSTED_HOSTS: "https://claude.ai" is not a host name`},
 		{"cimd host with a path", "BYWARD_CIMD_TRUSTED_HOSTS=claude.ai/oauth", `BYWARD_CIMD_TRUSTED_HOSTS: "claude.ai/oauth" is not a host name`},
-		{"cimd host with user info", "BYWARD_CIMD_ALLOWED_HOSTS=user@claude.example", `BYWARD_CIMD_ALLOWED_HOSTS: "user@claude.example" is not a host name`},
+		{"cimd host with user info", "BYWARD_CIMD_ALLOWED_HOSTS=user@claude.example", "BYWARD_CIMD_ALLOWED_HOSTS: " + logging.Hidden + ` is not a host name`},
 		// #344: names no client ID can carry, refused as in BYWARD_ALLOWED_HOSTS.
-		{"cimd host with a query", "BYWARD_CIMD_ALLOWED_HOSTS=a?b.example", `BYWARD_CIMD_ALLOWED_HOSTS: "a?b.example" is not a host name such as claude.ai: a host name has only letters`},
-		{"cimd host with a fragment", "BYWARD_CIMD_TRUSTED_HOSTS=a#b.example", `BYWARD_CIMD_TRUSTED_HOSTS: "a#b.example" is not a host name`},
+		{"cimd host with a query", "BYWARD_CIMD_ALLOWED_HOSTS=a?b.example", "BYWARD_CIMD_ALLOWED_HOSTS: " + logging.Hidden + ` is not a host name such as claude.ai: a host name has only letters`},
+		{"cimd host with a fragment", "BYWARD_CIMD_TRUSTED_HOSTS=a#b.example", "BYWARD_CIMD_TRUSTED_HOSTS: " + logging.Hidden + ` is not a host name`},
 		{"cimd host with a semicolon", "BYWARD_CIMD_ALLOWED_HOSTS=a;b.example", `BYWARD_CIMD_ALLOWED_HOSTS: "a;b.example" is not a host name`},
 		{"cimd host with a trailing dot", "BYWARD_CIMD_TRUSTED_HOSTS=claude.ai.", `BYWARD_CIMD_TRUSTED_HOSTS: "claude.ai." is not a host name such as claude.ai: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)`},
 		{"cimd host with a space", "BYWARD_CIMD_TRUSTED_HOSTS=claude .ai", `"claude .ai" is not a host name`},
@@ -253,6 +277,82 @@ func TestAllowedHostsLoadEveryHostHeaderFormAndBracketABareIPv6(t *testing.T) {
 	}
 }
 
+// An allowed host that is an IP address is stored as browsers write it (CanonicalHost), the form the
+// TLS certificate names check and the no-auth loopback check read (the Host check canonicalises both
+// sides itself, #447). Any other host is only lower-cased, even one ending in a number, which no
+// browser sends but a Go client may.
+func TestAnAllowedHostIsStoredWithItsAddressAsBrowsersWriteItAndANameOnlyInLowerCase(t *testing.T) {
+	for given, stored := range map[string]string{
+		"127.1:8080":      "127.0.0.1:8080",
+		"2001:DB8:0:0::1": "[2001:db8::1]",
+		"MCP.10":          "mcp.10",
+	} {
+		t.Run(given, func(t *testing.T) {
+			c, err := load(t, nil, "BYWARD_ALLOWED_HOSTS="+given)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(c.AllowedHosts, []string{stored}) {
+				t.Fatalf("stored %q, want %q", c.AllowedHosts, stored)
+			}
+		})
+	}
+}
+
+// CanonicalHost writes a host[:port] as browsers do, whichever spelling it was given in. The
+// expected values are what Node 25.1.0's WHATWG URL parser gives for http://<host>/ (checked
+// 2026-11-17); a host it refuses (marked) keeps its spelling, in lower case, since no browser sends it.
+func TestCanonicalHostWritesAnAddressAsBrowsersDoAndAnyOtherHostInLowerCase(t *testing.T) {
+	for given, want := range map[string]string{
+		"10.1":                       "10.0.0.1",
+		"0x0a.0.0.1":                 "10.0.0.1",
+		"010.0.0.1":                  "8.0.0.1",
+		"0X10.1":                     "16.0.0.1",
+		"0":                          "0.0.0.0",
+		"0x":                         "0.0.0.0",
+		"1.":                         "0.0.0.1",
+		"10.0.0.1.":                  "10.0.0.1",
+		"1.256":                      "1.0.1.0",
+		"1.16777215":                 "1.255.255.255",
+		"1.16777216":                 "1.16777216", // refused: the last of two numbers fills 3 bytes
+		"1.0x":                       "1.0.0.0",
+		"0x7f000001":                 "127.0.0.1",
+		"017700000001":               "127.0.0.1",
+		"4294967295":                 "255.255.255.255",
+		"0xffffffff":                 "255.255.255.255",
+		"127.1:8080":                 "127.0.0.1:8080",
+		"4294967296":                 "4294967296",                 // refused: too large
+		"256.0.0.1":                  "256.0.0.1",                  // refused
+		"1.2.65536":                  "1.2.65536",                  // refused
+		"09":                         "09",                         // refused: not octal
+		"1..2":                       "1..2",                       // refused
+		"a.0X0123456789abcdefABCDEF": "a.0x0123456789abcdefabcdef", // refused: a is not a number
+		"mcp.10":                     "mcp.10",                     // refused: mcp is not a number
+		"0x0g":                       "0x0g",                       // a name
+		"[FE80::1%25ETH0]:80":        "[fe80::1%25eth0]:80",        // refused: a zone, which no URL carries
+		"[::FFFF:1.2.3.4]:8080":      "[::ffff:102:304]:8080",      // a mapped address whose byte 14 is not 0
+		"FE80::1%ETH0":               "fe80::1%eth0",               // refused: a bare IPv6 address, with a zone
+		"0x10000000000000000":        "0x10000000000000000",        // refused: too large, never 0.0.0.0
+		"18446744073709551616":       "18446744073709551616",       // refused: too large, never 0.0.0.0
+		"1.2.3.4.0":                  "1.2.3.4.0",                  // refused: five numbers (the last, 0, is in range)
+		"[127.0.0.1]":                "[127.0.0.1]",                // refused: IPv4 in brackets
+		"[FE80::1]X":                 "[fe80::1]x",                 // refused: text after the brackets
+		"255.1":                      "255.0.0.1",
+		"Mcp.Example":                "mcp.example",
+		"[2001:DB8:0:0::1]":          "[2001:db8::1]",
+		"[2001:DB8:0:0::1]:8443":     "[2001:db8::1]:8443",
+		"[::FFFF:127.0.0.1]":         "[::ffff:7f00:1]",
+		"[1:0:0:0:2:0:0:3]":          "[1::2:0:0:3]",
+		"[::1.2.3.4]":                "[::102:304]",
+		"2001:db8::1":                "[2001:db8::1]", // a bare IPv6 address, a Host header form no URL carries: bracketed
+		"[X]":                        "[x]",           // refused
+	} {
+		if got := CanonicalHost(given); got != want {
+			t.Errorf("CanonicalHost(%q) = %q, want %q", given, got, want)
+		}
+	}
+}
+
 // Any IPv6 address may be listed in brackets, with or without a port: loopback or not, mapped or
 // not (#319).
 func TestAnIPv6AllowedHostIsAcceptedInBrackets(t *testing.T) {
@@ -272,6 +372,38 @@ func TestListsAreNormalized(t *testing.T) {
 	}
 	if strings.Join(c.AllowedOrigins, ",") != "https://app.example,http://localhost:3000" || c.AllowedHosts[0] != "internal:8080" {
 		t.Fatalf("origins=%v hosts=%v", c.AllowedOrigins, c.AllowedHosts)
+	}
+}
+
+// BYWARD_ALLOWED_ORIGINS holds origins as browsers send them (RFC 6454 §6.2), so each entry can match a
+// browser's Origin header: lower case, the scheme's default port dropped as the public URL's origin
+// drops it, and an IPv6 address as the WHATWG URL serializer writes it. Entries no browser could send
+// are refused (TestInvalidSettingsAreRejectedNamingTheSetting).
+func TestAllowedOriginsAreStoredAsBrowsersSendThem(t *testing.T) {
+	for given, stored := range map[string]string{
+		"https://App.example.com:443":   "https://app.example.com",
+		"http://app.example.com:80":     "http://app.example.com",
+		"http://app.example.com:443":    "http://app.example.com:443",
+		"https://app.example.com:8443":  "https://app.example.com:8443",
+		"https://[2001:DB8:0:0::1]:443": "https://[2001:db8::1]",
+		"https://[::ffff:127.0.0.1]":    "https://[::ffff:7f00:1]",
+		"https://1.2.3.4.example.com":   "https://1.2.3.4.example.com",
+		"https://1.example.com":         "https://1.example.com",
+		"https://a.1a":                  "https://a.1a",
+		"https://a.0xzz":                "https://a.0xzz",
+		"https://a.0a":                  "https://a.0a",
+		"http://127.0.0.1:3000":         "http://127.0.0.1:3000",
+		"HTTPS://XN--BCHER-KVA.example": "https://xn--bcher-kva.example",
+	} {
+		t.Run(given, func(t *testing.T) {
+			c, err := load(t, nil, "BYWARD_ALLOWED_ORIGINS="+given)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(c.AllowedOrigins, []string{stored}) {
+				t.Fatalf("stored %q, want %q", c.AllowedOrigins, stored)
+			}
+		})
 	}
 }
 
@@ -527,6 +659,11 @@ func TestUpstreamHeaderTimeoutDefaultsToFiveMinutesWithinBounds(t *testing.T) {
 	}
 }
 
+// Trusted proxies are CIDRs or addresses, masked; an IPv4-mapped one is the IPv4 prefix it maps,
+// since peers are compared unmapped, and one shorter than /96 maps no IPv4 prefix (masked, it would
+// trust IPv6 addresses), so it is refused. An entry inside fe80::/10 is refused, as it would trust no
+// peer; a zone too: it was dropped, and it swallowed any prefix length after it. Link-local is said
+// first, so removing the zone never leads to the second refusal.
 func TestTrustedProxiesTakeCIDRsAndAddresses(t *testing.T) {
 	cfg, _, err := Load(nil, noAuthEnv("BYWARD_TRUSTED_PROXIES=10.0.0.0/8, 192.0.2.7, 2001:db8::/32, 10.1.2.3/8"), nil)
 	if err != nil {
@@ -536,11 +673,78 @@ func TestTrustedProxiesTakeCIDRsAndAddresses(t *testing.T) {
 	if want := "[10.0.0.0/8 192.0.2.7/32 2001:db8::/32 10.0.0.0/8]"; got != want {
 		t.Errorf("trusted proxies = %s, want %s (bare addresses as /32 or /128, prefixes masked)", got, want)
 	}
+	for given, stored := range map[string]string{
+		"::ffff:10.0.0.5":       "10.0.0.5/32",
+		"::ffff:10.0.0.5/128":   "10.0.0.5/32",
+		"::ffff:172.16.0.0/108": "172.16.0.0/12",
+		"::ffff:0:0/96":         "0.0.0.0/0",
+		// Around fe80::/10 but not inside it (TestALoadedTrustedProxyListDecidesTheClientAddress).
+		"::/0":           "::/0",
+		"fe80::/9":       "fe80::/9", // starts in fe80::/10 but is wider
+		"fe00::/9":       "fe00::/9",
+		"fec0::1":        "fec0::1/128",
+		"169.254.0.0/16": "169.254.0.0/16", // IPv4 link-local has no zone
+	} {
+		t.Run(given, func(t *testing.T) {
+			cfg, _, err := Load(nil, noAuthEnv("BYWARD_TRUSTED_PROXIES="+given), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := fmt.Sprint(cfg.TrustedProxies); got != "["+stored+"]" {
+				t.Errorf("stored %s, want [%s]", got, stored)
+			}
+		})
+	}
 	if cfg, _, err := Load(nil, noAuthEnv(), nil); err != nil || len(cfg.TrustedProxies) != 0 {
 		t.Errorf("default trusted proxies = %v (err %v), want none", cfg.TrustedProxies, err)
 	}
-	if _, _, err := Load(nil, noAuthEnv("BYWARD_TRUSTED_PROXIES=proxy.internal"), nil); err == nil || !strings.Contains(err.Error(), "BYWARD_TRUSTED_PROXIES") {
-		t.Errorf("a hostname must be rejected with the setting named, got %v", err)
+	for _, tc := range []struct{ name, value, want string }{
+		{"a hostname", "proxy.internal", `BYWARD_TRUSTED_PROXIES: "proxy.internal" is not a CIDR or an IP address`},
+		{"a mapped /8", "::ffff:10.0.0.0/8", `BYWARD_TRUSTED_PROXIES: "::ffff:10.0.0.0/8" is an IPv4-mapped prefix shorter than /96: it maps no IPv4 prefix and would trust IPv6 addresses; give the IPv4 prefix instead (::ffff:10.0.0.0/104 is 10.0.0.0/8)`},
+		{"a mapped /95", "::ffff:10.0.0.0/95", `BYWARD_TRUSTED_PROXIES: "::ffff:10.0.0.0/95" is an IPv4-mapped prefix shorter than /96: it maps no IPv4 prefix and would trust IPv6 addresses; give the IPv4 prefix instead (::ffff:10.0.0.0/104 is 10.0.0.0/8)`},
+		// Parsed as an address, everything after % is the zone, the prefix length included.
+		{"a zoned prefix", "2001:db8::1%eth0/64", `BYWARD_TRUSTED_PROXIES: "2001:db8::1%eth0/64" has an IPv6 zone: give the proxy's routable address or CIDR, without a zone`},
+		{"a zoned address", "2001:db8::1%eth0", `BYWARD_TRUSTED_PROXIES: "2001:db8::1%eth0" has an IPv6 zone: give the proxy's routable address or CIDR, without a zone`},
+		{"a zoned mapped address", "::ffff:10.0.0.1%eth0", `BYWARD_TRUSTED_PROXIES: "::ffff:10.0.0.1%eth0" has an IPv6 zone: give the proxy's routable address or CIDR, without a zone`},
+		{"a zoned link-local prefix", "fe80::1%eth0/64", `BYWARD_TRUSTED_PROXIES: "fe80::1%eth0/64" is link-local: a link-local proxy cannot be trusted, as its address names a host only together with an interface; give the proxy's routable address or CIDR`},
+		{"a zoned link-local address", "fe80::1%eth0", `BYWARD_TRUSTED_PROXIES: "fe80::1%eth0" is link-local: a link-local proxy cannot be trusted, as its address names a host only together with an interface; give the proxy's routable address or CIDR`},
+		{"a link-local address", "fe80::1", `BYWARD_TRUSTED_PROXIES: "fe80::1" is link-local: a link-local proxy cannot be trusted, as its address names a host only together with an interface; give the proxy's routable address or CIDR`},
+		{"the link-local prefix", "fe80::/10", `BYWARD_TRUSTED_PROXIES: "fe80::/10" is link-local: a link-local proxy cannot be trusted, as its address names a host only together with an interface; give the proxy's routable address or CIDR`},
+		{"the last link-local address", "febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff", `BYWARD_TRUSTED_PROXIES: "febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff" is link-local: a link-local proxy cannot be trusted, as its address names a host only together with an interface; give the proxy's routable address or CIDR`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, err := Load(nil, noAuthEnv("BYWARD_TRUSTED_PROXIES="+tc.value), nil); err == nil || err.Error() != tc.want {
+				t.Errorf("err = %v\nwant %s", err, tc.want)
+			}
+		})
+	}
+}
+
+// A loaded trusted-proxy list decides the client address where it is resolved
+// (logging.ClientAddress). A mapped prefix trusts the IPv4 proxy it maps: kept mapped, it would trust
+// none, as peers are compared unmapped. ::/0, accepted although it contains fe80::/10, still trusts no
+// link-local peer, which arrives zoned.
+func TestALoadedTrustedProxyListDecidesTheClientAddress(t *testing.T) {
+	for _, tc := range []struct{ name, proxies, peer, want string }{
+		{"a mapped prefix trusts its IPv4 proxy", "::ffff:10.0.0.0/104", "10.1.2.3:4000", "198.51.100.1"},
+		{"::/0 trusts an IPv6 proxy", "::/0", "[2001:db8::1]:4000", "198.51.100.1"},
+		{"::/0 does not trust a zoned link-local proxy", "::/0", "[fe80::1%eth0]:4000", "fe80::1%eth0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, _, err := Load(nil, noAuthEnv("BYWARD_TRUSTED_PROXIES="+tc.proxies), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var client string
+			h := logging.ClientAddress(cfg.TrustedProxies, http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { client = logging.RemoteIP(r) }))
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.RemoteAddr = tc.peer
+			r.Header.Set("X-Forwarded-For", "198.51.100.1")
+			h.ServeHTTP(httptest.NewRecorder(), r)
+			if client != tc.want {
+				t.Fatalf("client %s, want %s (198.51.100.1 when the peer is trusted, else the peer)", client, tc.want)
+			}
+		})
 	}
 }
 
@@ -633,7 +837,7 @@ func TestInvalidStoreSettingsAreRejected(t *testing.T) {
 		// The counter file derived from a relative keys directory is not reported a second time; one the
 		// operator sets is.
 		{"a counter derived from a relative keys directory", []string{"BYWARD_KEYS_DIR=keys"}, "BYWARD_KEYS_DIR: want an absolute path", "BYWARD_STORE_COUNTER_FILE"},
-		{"a relative counter beside a relative keys directory", []string{"BYWARD_KEYS_DIR=keys", "BYWARD_STORE_COUNTER_FILE=writes"}, `BYWARD_STORE_COUNTER_FILE: want an absolute path (no paths relative to the working directory, ADR-0007 §6), got "writes"`, ""},
+		{"a relative counter beside a relative keys directory", []string{"BYWARD_KEYS_DIR=keys", "BYWARD_STORE_COUNTER_FILE=writes"}, `BYWARD_STORE_COUNTER_FILE: want an absolute path (no paths relative to the working directory, ADR-0007 §6), got a relative one`, ""},
 		{"counter inside the state directory", []string{"BYWARD_STORE_COUNTER_FILE=/var/lib/byward/state/writes"}, "is inside BYWARD_STORE_DIR", ""},
 		{"keys inside the state directory", []string{"BYWARD_KEYS_DIR=/var/lib/byward/state/keys"}, "keep the keys directory outside the state directory", ""},
 		{"grace not a duration", []string{"BYWARD_REFRESH_GRACE=soon"}, "BYWARD_REFRESH_GRACE: want a duration", ""},
@@ -725,7 +929,7 @@ func TestAnAllowedHostNameRefusesEveryCharacterAHostNameCannotHave(t *testing.T)
 		}
 		for _, entry := range []string{"a" + string(c) + "b", "a" + string(c) + "b:8443"} {
 			_, err := load(t, nil, "BYWARD_ALLOWED_HOSTS="+entry)
-			if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("%q is not a host[:port]: a host name", entry)) {
+			if err == nil || !strings.Contains(err.Error(), "is not a host[:port]: a host name") {
 				t.Errorf("BYWARD_ALLOWED_HOSTS=%s: %v, want it refused as a host name", entry, err)
 			}
 		}

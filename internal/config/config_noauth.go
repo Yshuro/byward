@@ -5,6 +5,8 @@ import (
 	"net"
 	"net/url"
 	"strings"
+
+	"github.com/byward-dev/byward/internal/logging"
 )
 
 // inContainer reports whether the proxy runs in a container (Docker or Podman marker file) that
@@ -91,8 +93,8 @@ func checkNoAuth(c *Config, v *Values) []error {
 	default:
 		errs = append(errs, errorf("%s: BYWARD_LISTEN must be a loopback address such as 127.0.0.1:8080 (non-loopback only inside a container with its own network, not --network host)", env))
 	}
-	for _, h := range c.AllowedHosts {
-		if !isLoopback(Hostname(h)) {
+	for _, h := range splitList(v.get("allowed-hosts")) { // as written, for the message; checked in its stored form
+		if n, err := normalizeAllowedHost(h); err == nil && !isLoopback(Hostname(n)) {
 			errs = append(errs, errorf("%s: BYWARD_ALLOWED_HOSTS may only list loopback hosts, got %q", env, h))
 		}
 	}
@@ -107,7 +109,7 @@ func checkNoAuth(c *Config, v *Values) []error {
 		}
 	}
 	if len(errs) == 0 {
-		c.Relaxations = append(c.Relaxations, "AUTHENTICATION IS OFF: anyone who can reach "+c.PublicURL.String()+" can use the upstream, and the upstream receives no identity")
+		c.Relaxations = append(c.Relaxations, "AUTHENTICATION IS OFF: anyone who can reach "+logging.MarkedURL(c.PublicURL.String())+" can use the upstream, and the upstream receives no identity")
 	}
 	return errs
 }

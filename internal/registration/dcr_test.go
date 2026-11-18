@@ -138,13 +138,16 @@ func brokenClients() *memstore.Store {
 	return s
 }
 
-func TestAStoreFailureIsTemporary(t *testing.T) {
+// A store failure is a store outage (ErrStoreUnavailable): never a refusal of the client, and never
+// the CIMD "metadata could not be fetched" (ErrUnavailable), which the broker answers differently.
+func TestAStoreFailureIsAStoreOutageNotARefusal(t *testing.T) {
 	r := newDCR(brokenClients(), newClock().Now, 0)
-	if _, err := r.Register(context.Background(), []byte(`{"client_name":"App","redirect_uris":["https://app.example/cb"]}`)); !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("register: %v", err)
-	}
-	if _, err := r.Client(context.Background(), DCRIDPrefix+"x"); !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("lookup: %v", err)
+	_, regErr := r.Register(context.Background(), []byte(`{"client_name":"App","redirect_uris":["https://app.example/cb"]}`))
+	_, lookupErr := r.Client(context.Background(), DCRIDPrefix+"x")
+	for name, err := range map[string]error{"register": regErr, "lookup": lookupErr} {
+		if !errors.Is(err, ErrStoreUnavailable) || errors.Is(err, ErrUnavailable) || errors.Is(err, ErrUnknownClient) {
+			t.Errorf("%s: %v, want ErrStoreUnavailable only", name, err)
+		}
 	}
 }
 
@@ -263,6 +266,45 @@ func TestAStoredRegistrationThatCannotBeUsedIsUnknown(t *testing.T) {
 			_, err := newDCR(st, c.Now, 0).Client(context.Background(), rec.ID)
 			if !errors.Is(err, ErrUnknownClient) || errors.Is(err, ErrMetadataRefused) {
 				t.Fatalf("err = %v, want unknown and never refused", err)
+			}
+		})
+	}
+}
+
+// A stored registration whose redirect URI today's rules refuse is unknown, and the error, which the
+// broker logs (grantScopes), shows that URI as logs may: scheme, host and path, never its user
+// information or query (security invariant 2, #462). Before, the refused URI was quoted whole.
+func TestAStoredRegistrationsLookupErrorShowsItsRefusedRedirectURIWithoutItsUserInformationOrQuery(t *testing.T) {
+	c := newClock()
+	const refused = "alice:pa55word@" // user information, which today's rules refuse
+	for _, tc := range []struct {
+		name string
+		uris []string
+		want string // the error's text for the refused URI
+	}{
+		{"https", []string{"https://" + refused + "app.example/cb?code=s3cret"}, "redirect_uris[0]: redirect URI https://app.example/cb rejected"},
+		{"a custom scheme", []string{"myapp://" + refused + "cb/done?code=s3cret"}, "redirect_uris[0]: redirect URI myapp://cb/done rejected"},
+		{"the second of two", []string{"https://app.example/ok", "https://" + refused + "app.example/cb?code=s3cret"}, "redirect_uris[1]: redirect URI https://app.example/cb rejected"},
+		{"the first of two", []string{"https://" + refused + "app.example/cb?code=s3cret", "https://app.example/ok"}, "redirect_uris[0]: redirect URI https://app.example/cb rejected"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			meta, err := json.Marshal(map[string]any{"client_name": "App", "redirect_uris": tc.uris})
+			if err != nil {
+				t.Fatal(err)
+			}
+			st := memory.New()
+			rec := store.Client{ID: DCRIDPrefix + "stored", Metadata: meta, CreatedAt: c.Now().Add(-time.Hour), ExpiresAt: c.Now().Add(time.Hour)}
+			if err := st.CreateClient(context.Background(), rec, 10); err != nil {
+				t.Fatal(err)
+			}
+			_, err = newDCR(st, c.Now, 0).Client(context.Background(), rec.ID)
+			if !errors.Is(err, ErrUnknownClient) || !strings.Contains(err.Error(), "stored registration: "+tc.want) {
+				t.Fatalf("err = %v; want unknown, with %q", err, tc.want)
+			}
+			for _, secret := range []string{"alice", "pa55word", "s3cret", "code="} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("err = %v; it quotes %q", err, secret)
+				}
 			}
 		})
 	}

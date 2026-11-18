@@ -4,17 +4,19 @@
 as the proxy ([settings](settings.md)), so run them with the proxy's configuration;
 `downstream-token` is the exception: it reads only `BYWARD_DOWNSTREAM_TOKEN_SOCKET`. They take no
 setting flags; give settings through the environment. A stdio upstream given on the command line goes
-after `--`, as for the proxy (`byward check --offline -- /usr/local/bin/server --flag`).
-`byward --help` lists them.
+after `--`, as for the proxy (`byward check --offline -- /usr/local/bin/server --flag`); none of
+these commands starts it. Without authentication (`BYWARD_INSECURE_NO_AUTH`) the broker's store is off, so
+revoke-user, revoke-all and store new-epoch exit 2, and no identity assertion is sent, so jwks exits 2
+too. `byward --help` lists them.
 
 | Command | What it does | Network | Exit codes |
 |---|---|---|---|
 | `byward check --offline [-- <command>]` | validates the configuration as the proxy does at startup | none | 0, 2 |
 | `byward doctor [--json] [-- <command>]` | probes the running proxy as MCP clients do, and the IdP app | the public URL and the IdP | 0, 2, 4, 8, 12 |
 | `byward init entra --tenant <id>` | prints the `az` commands for the Entra app registration and a minimal env file | none | 0, 2 |
-| `byward revoke-user <user key>` | ends one user's access ([below](#byward-revoke-user)) | the store | 0, 1, 2 |
-| `byward revoke-all --yes` | ends every user's access ([below](#byward-revoke-all)) | the store | 0, 1, 2 |
-| `byward store new-epoch --yes` | after restoring the PostgreSQL store: starts a new store epoch, so refresh tokens from before it are refused ([below](#byward-store-new-epoch)) | the store | 0, 1, 2 |
+| `byward revoke-user <user key> [-- <command>]` | ends one user's access ([below](#byward-revoke-user)) | the store | 0, 1, 2 |
+| `byward revoke-all --yes [-- <command>]` | ends every user's access ([below](#byward-revoke-all)) | the store | 0, 1, 2 |
+| `byward store new-epoch --yes [-- <command>]` | after restoring the PostgreSQL store: starts a new store epoch, so refresh tokens from before it are refused ([below](#byward-store-new-epoch)) | the store | 0, 1, 2 |
 | `byward jwks` | prints the identity assertion's public keys as a JWKS, for an upstream that loads them from a file ([below](#byward-jwks)) | none | 0, 2 |
 | `byward downstream-token [--json]` | run by a stdio upstream process or one of its descendants: prints its user's On-Behalf-Of token from `BYWARD_DOWNSTREAM_TOKEN_SOCKET`, for a server that takes a credential command ([below](#byward-downstream-token)) | the token socket | 0, 1, 2 |
 
@@ -37,7 +39,15 @@ Checks everything the proxy checks at startup that needs no network and writes n
   is created at startup, and the counter file's directory must exist, it is not created); with
   PostgreSQL, the DSN as startup parses it, including the `sslmode=verify-full` rule, without
   connecting. Nothing is created;
-- with `BYWARD_TLS_CERT_FILE`, the TLS certificate and key: readable, a matching pair, and valid now.
+- with `BYWARD_TLS_CERT_FILE`, the TLS certificate and key: readable, a matching pair, and valid now;
+- with `OTEL_TRACES_EXPORTER` set, the trace exporter as startup builds it from the `OTEL_*` settings:
+  an unknown exporter or OTLP protocol, or, over `http/protobuf` (the default), an insecure endpoint
+  (`http://` or `unix://`, or `OTEL_EXPORTER_OTLP_[TRACES_]INSECURE=true`) with a CA certificate or a
+  client certificate and key, is a configuration error. It connects to
+  nothing, and never prints a setting's value. A value the exporter ignores (a header it cannot
+  parse, a missing CA file) is logged as a `tracing error` on standard error, in the proxy's log
+  format, as at startup, and check still passes; the sampler and resource settings are read only at
+  startup. Run check with the proxy's `OTEL_*` settings.
 
 It prints each relaxation (`warn  relaxation: …`) and the warnings the proxy would log at startup (an
 empty access gate, generic consent wording, a client secret or client certificate that expires within 30 days, a TLS certificate that
@@ -75,7 +85,7 @@ fail  idp    entra app and credential: Entra rejected the client secret (AADSTS7
 | `proxy` | trust store | On `main`, not in v0.2.0: where the roots byward trusts for the IdP, an https upstream and client metadata documents (CIMD) come from: `SSL_CERT_FILE` and `SSL_CERT_DIR` (and how many certificates each yields), or the system's default locations, and how many roots Go loaded. A warning when `SSL_CERT_FILE` cannot be read or holds no PEM certificate Go accepts (Go reads nothing from it, without an error, and the warning says what it trusts instead), or when it names a file other than a public bundle and `SSL_CERT_DIR` leaves out the public directories (`/etc/ssl/certs`, `/etc/pki/tls/certs`): Go then reads only those, so the public roots are dropped unless that file holds them. On macOS and Windows either setting replaces the system's verifier, which is a warning too, unless `GODEBUG=x509sslcertoverrideplatform=0` keeps that verifier: both settings are then ignored, a warning when either is set. Each `SSL_CERT_DIR` entry is read as Go reads it: a warning when an entry is not a directory Go can read or holds no PEM certificate Go accepts, or when no entry exists; an entry that does not exist beside others is reported as skipped. The warnings say what Go trusts instead: on macOS and Windows, an entry or file that fails other than by not existing makes Go fall back to the system's verifier when nothing else yields a certificate. See [trust a private CA](../how-to/private-ca.md) |
 | `proxy` | upstream hop | shown only as a warning: the HTTP upstream is `http` and its host resolves to a public address, so the secrets each request carries (the identity assertion, the upstream credential, an On-Behalf-Of token) travel in clear. A host that does not resolve gets no warning. Also logged at startup, and by `check --offline` for an upstream given as an address |
 | `proxy` | identity headers | with `BYWARD_IDENTITY_HEADERS` and an HTTP upstream: the upstream's host resolves only to loopback, private, link-local, shared (CGNAT) or unspecified addresses (a warning when it has a public address or does not resolve). A hint, not a guarantee: doctor sees addresses, not who can reach them |
-| `proxy` | configuration | never fails; one warning per startup warning (an empty access gate, generic consent wording), and with the PostgreSQL store the reminder that every replica needs the same keys |
+| `proxy` | configuration | never fails; on `main`, not in v0.2.0: one warning per relaxation that `--dev` or `--insecure-no-auth` turned on (`relaxation: …`, as `check --offline` prints it); one per startup warning (an empty access gate, generic consent wording), and with the PostgreSQL store the reminder that every replica needs the same keys |
 | `proxy` | protected resource metadata (path-inserted) | `/.well-known/oauth-protected-resource<path>` answers 200 with `resource` equal to the public URL and our issuer first in `authorization_servers` |
 | `proxy` | protected resource metadata (root) | the same at `/.well-known/oauth-protected-resource` |
 | `proxy` | authorization server metadata (RFC 8414) | `/.well-known/oauth-authorization-server` names our issuer, `authorization_response_iss_parameter_supported: true`, `S256`, and a `revocation_endpoint` |
@@ -102,8 +112,9 @@ with AADSTS501051 unless the app holds a role on itself. Doctor then reports the
 passed, since Entra checked it before refusing, and the access token as a skip, with the
 `az ad app show` command that checks its version by hand.
 
-With `BYWARD_INSECURE_NO_AUTH` there is no discovery and no IdP: doctor runs the TLS certificate,
-`upstream`, `trust store`, `upstream hop` and `configuration` checks, then reports `authentication` as a warning.
+With `BYWARD_INSECURE_NO_AUTH` there is no discovery and no IdP: doctor runs the TLS certificate and
+`configuration` checks (among them its relaxations, `AUTHENTICATION IS OFF` included), then
+`upstream`, `trust store` and `upstream hop`, then reports `authentication` as a warning.
 
 ### Statuses and exit codes
 
@@ -155,7 +166,9 @@ byward init entra --tenant <tenant-id> [--public-url <url>] [--upstream-url <url
 ```
 
 Prints a shell script; byward runs none of it, calls no API and never sees the client secret.
-`--public-url` and `--upstream-url` default to `BYWARD_PUBLIC_URL` and `BYWARD_UPSTREAM_URL`. Review
+`--public-url` and `--upstream-url` default to `BYWARD_PUBLIC_URL` and `BYWARD_UPSTREAM_URL`, and init
+checks both as the proxy checks those settings: a URL the proxy would refuse exits 2 before any script
+is printed, and a password in it is never shown. Review
 the script, then run it with the Azure CLI signed in to the tenant (`az login --tenant <tenant-id>`;
 the script stops if `az` is signed in elsewhere). It follows
 [the Entra quickstart](../how-to/quickstart-entra.md) step 1 and adds what app-only callers need
@@ -190,7 +203,7 @@ proxy and run `byward doctor`.
 Which command fits which situation: [revoke access](../how-to/revoke-access.md).
 
 ```sh
-byward revoke-user <user key>
+byward revoke-user <user key> [-- <command>]
 ```
 
 Deletes every grant of one user and records a cut-off, so every proxy using the same store refuses
@@ -198,30 +211,44 @@ the user's refresh tokens at once and their access tokens at its next deny-list 
 seconds. The user key is the one the audit records show as `user_key`: with Entra, `tid:oid` (the
 tenant and object IDs); with an `oidc` IdP, the value of its subject claim (`BYWARD_OIDC_SUBJECT_CLAIM`,
 `sub` by default). It runs beside a running proxy. A key that is not a user key of the configured
-IdP exits 2; a store that cannot be opened or written exits 1. The revocation is audited as
-`grant_revoked` with the reason `operator revoke-user`, by the command and by each running proxy at
-its next deny-list sync ([where it is recorded](../how-to/revoke-access.md#where-an-operator-revocation-is-recorded)).
+IdP exits 2, and so do IdP settings it cannot build the IdP from (an Entra certificate or OIDC client
+key file that holds no key), with the configuration error the proxy gives for them at startup. It
+builds only what it needs to read the user key, so it still works with an expired Entra certificate
+or, with an `oidc` IdP, an empty [access gate](../how-to/access-gate.md#empty-gate), which the proxy
+and `check --offline` refuse at startup. A store that is there but cannot be opened or written exits 1. The
+revocation is audited as `grant_revoked` with the reason `operator revoke-user`, by the command and by
+each running proxy at its next deny-list sync ([where it is recorded](../how-to/revoke-access.md#where-an-operator-revocation-is-recorded)).
+
+It acts only on the store a proxy already uses, and prints the user and that store (the state
+directory, or the PostgreSQL database, never the DSN). Where the settings point at no byward store (no
+`byward.db` in `BYWARD_STORE_DIR`, or a database that does not exist or holds no byward schema), it
+exits 2 naming the setting and where it looked, having created and written nothing: a mistyped
+setting is never taken for a done revocation. It never migrates: a store at another byward version's
+schema exits 1 and is left unchanged. Run the command with the proxy's byward version, or, for an older
+schema, start the upgraded proxy first.
 
 ## `byward revoke-all`
 
 ```sh
-byward revoke-all --yes
+byward revoke-all --yes [-- <command>]
 ```
 
 The same for every user at once, for incident response: everyone signs in again. `--yes` is required.
-Audited as `grant_revoked` with the reason `operator revoke-all`, by the command and by each running
+It finds the store, and names it, as `revoke-user` does: no byward store where the settings point
+exits 2. Audited as `grant_revoked` with the reason `operator revoke-all`, by the command and by each running
 proxy ([where it is recorded](../how-to/revoke-access.md#where-an-operator-revocation-is-recorded)).
 
 ## `byward store new-epoch`
 
 ```sh
-byward store new-epoch --yes
+byward store new-epoch --yes [-- <command>]
 ```
 
 For the PostgreSQL store, after a `pg_restore` or a point-in-time recovery: starts a new store epoch,
 so refresh tokens issued before it are refused and their users sign in again, and forgets every
-remembered consent. Running replicas adopt the epoch at once. It prints the new epoch and is audited as
-`store_restored` with the reason `operator new-epoch`. With the SQLite store it exits 2: SQLite finds a
+remembered consent. Running replicas adopt the epoch at once. A database that holds no byward schema
+exits 2, as for `revoke-user`; the command never creates or migrates the schema. It prints the new
+epoch and the database, and is audited as `store_restored` with the reason `operator new-epoch`. With the SQLite store it exits 2: SQLite finds a
 restore by itself at startup ([state](../how-to/state.md#restore-detection)). See
 [PostgreSQL](../how-to/postgres.md#backup-and-restore).
 
@@ -254,5 +281,5 @@ These are flags of the proxy itself (`byward` with no command), read with the sa
 |---|---|---|
 | `byward --help` | prints the settings and the commands | 0 |
 | `byward --version [--json]` | prints the version, the source revision and the Go version; with `--json`, an object with `version`, `revision`, `time`, `modified` (only when set) and `go_version` | 0 |
-| `byward --print-config` | prints every setting as `NAME=value (source)`, the source being `flag`, `env`, `file` or `default`; secrets show as `<redacted>` | 0, 2 |
+| `byward --print-config` | prints every setting as `NAME=value (source)`, the source being `flag`, `env`, `file` or `default`; secrets show as `<redacted>`, a URL setting by its scheme, host and path, with `?…` (or `;…`, `#…`) where a part that can hold an API key is left out, and the stdio upstream's command by its program and the number of arguments | 0, 2 |
 

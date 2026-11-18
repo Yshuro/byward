@@ -13,6 +13,7 @@ import (
 	"github.com/byward-dev/byward/internal/config"
 	"github.com/byward-dev/byward/internal/doctor"
 	"github.com/byward-dev/byward/internal/gate"
+	"github.com/byward-dev/byward/internal/logging"
 	"github.com/byward-dev/byward/internal/registration"
 	"github.com/byward-dev/byward/internal/secretfile"
 	"github.com/byward-dev/byward/internal/token"
@@ -107,7 +108,7 @@ func (w Warning) String() string {
 // settings. Errors name the file or setting at fault. idpHTTP reaches the IdP; nil is the default
 // client (tests give a fake's).
 func loadAuthParts(cfg *config.Config, idpHTTP *http.Client) (*authParts, error) {
-	ring, err := token.LoadKeyRing(cfg.KeysDir)
+	ring, err := token.LoadKeyRing(cfg.KeysDir, secretCheck(cfg))
 	if err != nil {
 		// No key generation (ADR-0007 §5): the operator creates the first key.
 		return nil, fmt.Errorf("BYWARD_KEYS_DIR: %s: %w (see docs/how-to/sealing-keys.md)", cfg.KeysDir, err)
@@ -209,22 +210,22 @@ func looseSecretFiles(cfg *config.Config) []error {
 	check := secretCheck(cfg)
 	var loose []error
 	for _, f := range cfg.Values.SecretFiles() {
-		if err := check(f.Path); err != nil {
-			loose = append(loose, fmt.Errorf("%s: %w", f.From, err))
+		if err := check(f.Path); err != nil { // no path: a secret pasted where its file's path belongs would show (#461)
+			loose = append(loose, fmt.Errorf("%s: %w", f.From, logging.FileError(err)))
 		}
 	}
 	if f := cfg.TLSKeyFile; f != "" {
 		if err := check(f); err != nil {
-			loose = append(loose, fmt.Errorf("%s: %w", tlsKeyEnv, err))
+			loose = append(loose, fmt.Errorf("%s: %w", tlsKeyEnv, logging.FileError(err)))
 		}
 	}
 	// A federated token is a credential too, though it is read at each request, not at start.
 	if f := cfg.EntraFederatedTokenFile; f != "" {
 		// It must exist even in --dev, as every other secret file must to be read at start.
 		if _, err := os.Stat(f); err != nil {
-			loose = append(loose, fmt.Errorf("%s: %w", config.Setting{Name: "entra-federated-token-file"}.Env(), err))
+			loose = append(loose, fmt.Errorf("%s: %w", config.Setting{Name: "entra-federated-token-file"}.Env(), logging.FileError(err)))
 		} else if err := check(f); err != nil {
-			loose = append(loose, fmt.Errorf("%s: %w", config.Setting{Name: "entra-federated-token-file"}.Env(), err))
+			loose = append(loose, fmt.Errorf("%s: %w", config.Setting{Name: "entra-federated-token-file"}.Env(), logging.FileError(err)))
 		}
 	}
 	return loose
