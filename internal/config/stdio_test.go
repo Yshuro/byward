@@ -1,8 +1,10 @@
 package config
 
 import (
+	"fmt"
 	"maps"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -65,6 +67,142 @@ func TestStdioEnvFileValuesAreParsedAndNeverDisplayed(t *testing.T) {
 			t.Fatalf("command displays as %q, want its program", v.Display())
 		}
 	}
+}
+
+// A command that takes no arguments loads with LoadEnvironment: a missing or malformed upstream URL
+// names the stdio upstream's variable only, never a command after --, which such a command refuses.
+// Load, for the proxy and the commands that take --, still names both (#499).
+func TestLoadEnvironmentNeverSuggestsACommandAfterDashesWhereLoadDoes(t *testing.T) {
+	for _, tc := range []struct {
+		name, url, withoutDashes, withDashes string
+	}{
+		{"no upstream", "", "BYWARD_UPSTREAM_URL is required (or BYWARD_UPSTREAM_COMMAND)",
+			"BYWARD_UPSTREAM_URL is required (or BYWARD_UPSTREAM_COMMAND, or a command after --)"},
+		{"a malformed upstream URL", "BYWARD_UPSTREAM_URL=ftp://u/mcp", `BYWARD_UPSTREAM_URL: want an absolute http(s) URL, got "ftp://u/mcp" (or BYWARD_UPSTREAM_COMMAND)`,
+			`BYWARD_UPSTREAM_URL: want an absolute http(s) URL, got "ftp://u/mcp" (or BYWARD_UPSTREAM_COMMAND, or a command after --)`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := stdioBase()
+			if tc.url != "" {
+				env = append(env, tc.url)
+			}
+			if _, err := LoadEnvironment(env, baseFiles); !isConfigError(err) || err.Error() != tc.withoutDashes {
+				t.Errorf("LoadEnvironment: got %v, want the config error %q", err, tc.withoutDashes)
+			}
+			if _, _, err := Load(nil, env, baseFiles); !isConfigError(err) || err.Error() != tc.withDashes {
+				t.Errorf("Load: got %v, want the config error %q", err, tc.withDashes)
+			}
+		})
+	}
+}
+
+// LoadEnvironment loads what Load loads without arguments, the whole Config or the same error: an
+// HTTP or a stdio upstream, a container's no-auth relaxation (which needs the host checks), and an
+// unknown variable, refused before any setting is validated. Each row also pins one result, so the
+// two cannot agree on a wrong one.
+func TestLoadEnvironmentLoadsWhatLoadLoadsWithoutArguments(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		env      []string
+		readFile readFileFunc
+		check    func(*Config, error) bool
+	}{
+		{"HTTP", base, baseFiles, func(c *Config, err error) bool {
+			return err == nil && c != nil && c.UpstreamURL.String() == "http://upstream:9000/mcp"
+		}},
+		{"stdio", stdioBase(`BYWARD_UPSTREAM_COMMAND=["/usr/bin/server","--flag"]`), baseFiles,
+			func(c *Config, err error) bool {
+				return err == nil && c != nil && slices.Equal(c.UpstreamCommand, []string{"/usr/bin/server", "--flag"})
+			}},
+		{"no-auth in a container", append(slices.Clone(anon), "BYWARD_LISTEN=0.0.0.0:8080"), fakeHost("/.dockerenv", bridgeNetdev),
+			func(c *Config, err error) bool { return err == nil && c != nil && c.InContainer }},
+		{"an unknown variable", append(slices.Clone(base), "BYWARD_TYPO=x"), baseFiles,
+			func(_ *Config, err error) bool {
+				return isConfigError(err) && strings.HasPrefix(err.Error(), "unknown setting BYWARD_TYPO")
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, gotErr := LoadEnvironment(tc.env, tc.readFile)
+			want, _, wantErr := Load(nil, tc.env, tc.readFile)
+			if !tc.check(got, gotErr) {
+				t.Fatalf("LoadEnvironment: %+v, %v", got, gotErr)
+			}
+			if fmt.Sprint(gotErr) != fmt.Sprint(wantErr) {
+				t.Errorf("error: LoadEnvironment %v, Load %v", gotErr, wantErr)
+			}
+			if got == nil || want == nil {
+				if got != want {
+					t.Errorf("Config: LoadEnvironment %v, Load %v", got, want)
+				}
+				return
+			}
+			diff := configDiff(*got, *want)
+			for _, f := range diff {
+				t.Errorf("Config.%s", f)
+			}
+			if len(diff) == 0 && !reflect.DeepEqual(*got, *want) { // a backstop, so a broken configDiff cannot hide a drift
+				t.Errorf("Config differs, though configDiff names no field: LoadEnvironment %+v %+v, Load %+v %+v", *got, got.Values, *want, want.Values)
+			}
+		})
+	}
+}
+
+// configDiff lists each field in which LoadEnvironment's Config (got) differs from Load's (want),
+// with both values. A setting in Values is named by its key, whichever side has it, so a mismatch
+// reads as the setting, not as two pointer addresses.
+func configDiff(got, want Config) []string {
+	var out []string
+	gv, wv := reflect.ValueOf(got), reflect.ValueOf(want)
+	for i := range gv.NumField() {
+		name := gv.Type().Field(i).Name
+		if name == "Values" {
+			out = append(out, valuesDiff(got.Values, want.Values)...)
+			continue
+		}
+		if g, w := gv.Field(i).Interface(), wv.Field(i).Interface(); !reflect.DeepEqual(g, w) {
+			out = append(out, fmt.Sprintf("%s: LoadEnvironment %+v, Load %+v", name, g, w))
+		}
+	}
+	return out
+}
+
+// valuesDiff is configDiff for the resolved settings: each setting either side has that differs,
+// then the setting order or the command after --, when only those differ.
+func valuesDiff(got, want *Values) []string {
+	if got == nil || want == nil {
+		if got != want {
+			return []string{fmt.Sprintf("Values: LoadEnvironment nil %v, Load nil %v", got == nil, want == nil)}
+		}
+		return nil
+	}
+	var out []string
+	keys := slices.AppendSeq(slices.Collect(maps.Keys(got.byKey)), maps.Keys(want.byKey))
+	slices.Sort(keys)
+	for _, k := range slices.Compact(keys) {
+		g, gok := got.byKey[k]
+		w, wok := want.byKey[k]
+		if gok != wok || !reflect.DeepEqual(g, w) {
+			gs, ws := describeSetting(g, gok), describeSetting(w, wok)
+			if gs == ws { // they differ in the registry entry only
+				gs, ws = fmt.Sprintf("%+v", g), fmt.Sprintf("%+v", w)
+			}
+			out = append(out, fmt.Sprintf("Values[%s]: LoadEnvironment %s, Load %s", k, gs, ws))
+		}
+	}
+	if len(out) == 0 && !reflect.DeepEqual(*got, *want) {
+		out = append(out, "Values: the setting order or the command after -- differs")
+	}
+	return out
+}
+
+// describeSetting shows what the operator gave for a setting, without its registry entry: the value,
+// where it came from, the file it was read from and the flag or variable that named that file, or
+// that the setting is absent.
+func describeSetting(v Value, present bool) string {
+	if !present {
+		return "absent"
+	}
+	return fmt.Sprintf("%q from %v, path %q named by %q", v.Raw, v.Source, v.Path, v.From)
 }
 
 func TestInvalidStdioSettingsAreRejectedNamingTheSetting(t *testing.T) {
