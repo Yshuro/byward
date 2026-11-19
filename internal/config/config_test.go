@@ -103,6 +103,9 @@ func TestInvalidSettingsAreRejectedNamingTheSetting(t *testing.T) {
 		{"public host empty, with a port", "BYWARD_PUBLIC_URL=https://:8443/mcp", `BYWARD_PUBLIC_URL: give a host, e.g. https://mcp.example.com/mcp`},
 		{"public host with a double dot", "BYWARD_PUBLIC_URL=https://a..b/mcp", `BYWARD_PUBLIC_URL: "a..b" is not a host[:port]: a host name`},
 		{"public host with a wildcard", "BYWARD_PUBLIC_URL=https://a*b/mcp", `BYWARD_PUBLIC_URL: "a*b" is not a host[:port]: a host name`},
+		// A browser lower-cases a host name, and byward does not rewrite it: the issuer and the IdP
+		// redirect URI are built from it as written (#472).
+		{"public host name in upper case", "BYWARD_PUBLIC_URL=https://MCP.Example.com/mcp", "BYWARD_PUBLIC_URL: the host name MCP.Example.com is not in the form browsers write it; write it as mcp.example.com"},
 		// #353: the port and the zone follow BYWARD_ALLOWED_HOSTS' rules too.
 		{"public URL with an empty port", "BYWARD_PUBLIC_URL=https://a.example:/mcp", `BYWARD_PUBLIC_URL: "a.example:" is not a host[:port]: give host, host:port, an IPv6 address, [IPv6] or [IPv6]:port, with a port from 1 to 65535 and no IPv6 zone`},
 		{"public URL with a port over 65535", "BYWARD_PUBLIC_URL=https://a.example:65536/mcp", `BYWARD_PUBLIC_URL: "a.example:65536" is not a host[:port]`},
@@ -125,15 +128,15 @@ func TestInvalidSettingsAreRejectedNamingTheSetting(t *testing.T) {
 		{"origin with an IPv6 zone", "BYWARD_ALLOWED_ORIGINS=https://[fe80::1%25eth0]", `BYWARD_ALLOWED_ORIGINS: "https://[fe80::1%25eth0]": "[fe80::1%eth0]" is not a host[:port]`},
 		{"origin with a shortened IPv4 address", "BYWARD_ALLOWED_ORIGINS=https://127.1", `BYWARD_ALLOWED_ORIGINS: "https://127.1": "127.1" is not an IPv4 address in dotted decimal, the only form browsers send`},
 		{"origin ending in an upper-case hex label", "BYWARD_ALLOWED_ORIGINS=https://192.168.0.0xFF", `BYWARD_ALLOWED_ORIGINS: "https://192.168.0.0xFF": "192.168.0.0xFF" is not an IPv4 address in dotted decimal`},
-		{"origin with an IPv4 part over 255", "BYWARD_ALLOWED_ORIGINS=https://10.0.0.999", `BYWARD_ALLOWED_ORIGINS: "https://10.0.0.999": "10.0.0.999" is not an IPv4 address in dotted decimal`},
+		{"origin with an IPv4 part over 255", "BYWARD_ALLOWED_ORIGINS=https://10.0.0.999", `BYWARD_ALLOWED_ORIGINS: "https://10.0.0.999": "10.0.0.999" is not an IPv4 address but ends in a number, so browsers refuse it`},
 		{"origin with user info", "BYWARD_ALLOWED_ORIGINS=https://user@app.example.com", `is not an origin (scheme://host[:port]): it has a user name or password`},
 		{"origin that is not a URL", "BYWARD_ALLOWED_ORIGINS=https://[::1", `BYWARD_ALLOWED_ORIGINS: "https://[::1" is not an origin`},
-		{"origin ending in a hex label of every hex digit", "BYWARD_ALLOWED_ORIGINS=https://a.0x0123456789abcdef", `BYWARD_ALLOWED_ORIGINS: "https://a.0x0123456789abcdef": "a.0x0123456789abcdef" is not an IPv4 address in dotted decimal`},
-		{"origin ending in a bare 0", "BYWARD_ALLOWED_ORIGINS=https://a.0", `BYWARD_ALLOWED_ORIGINS: "https://a.0": "a.0" is not an IPv4 address in dotted decimal`},
-		{"origin ending in a bare 0x", "BYWARD_ALLOWED_ORIGINS=https://a.0x", `BYWARD_ALLOWED_ORIGINS: "https://a.0x": "a.0x" is not an IPv4 address in dotted decimal`},
-		{"origin ending in a label of every digit", "BYWARD_ALLOWED_ORIGINS=https://a.1234567890", `BYWARD_ALLOWED_ORIGINS: "https://a.1234567890": "a.1234567890" is not an IPv4 address in dotted decimal`},
+		{"origin ending in a hex label of every hex digit", "BYWARD_ALLOWED_ORIGINS=https://a.0x0123456789abcdef", `BYWARD_ALLOWED_ORIGINS: "https://a.0x0123456789abcdef": "a.0x0123456789abcdef" is not an IPv4 address but ends in a number, so browsers refuse it`},
+		{"origin ending in a bare 0", "BYWARD_ALLOWED_ORIGINS=https://a.0", `BYWARD_ALLOWED_ORIGINS: "https://a.0": "a.0" is not an IPv4 address but ends in a number, so browsers refuse it`},
+		{"origin ending in a bare 0x", "BYWARD_ALLOWED_ORIGINS=https://a.0x", `BYWARD_ALLOWED_ORIGINS: "https://a.0x": "a.0x" is not an IPv4 address but ends in a number, so browsers refuse it`},
+		{"origin ending in a label of every digit", "BYWARD_ALLOWED_ORIGINS=https://a.1234567890", `BYWARD_ALLOWED_ORIGINS: "https://a.1234567890": "a.1234567890" is not an IPv4 address but ends in a number, so browsers refuse it`},
 		{"origin with a shortened IPv4 address and a port", "BYWARD_ALLOWED_ORIGINS=http://127.1:8080", `BYWARD_ALLOWED_ORIGINS: "http://127.1:8080": "127.1" is not an IPv4 address in dotted decimal`},
-		{"origin with a hex IPv4 label", "BYWARD_ALLOWED_ORIGINS=https://0x7f.0.0.1", `BYWARD_ALLOWED_ORIGINS: "https://0x7f.0.0.1": "0x7f.0.0.1" is not an IPv4 address in dotted decimal`},
+		{"origin with a hex IPv4 label", "BYWARD_ALLOWED_ORIGINS=https://0x7f.0.0.1", `BYWARD_ALLOWED_ORIGINS: "https://0x7f.0.0.1": "0x7f.0.0.1" is not an IPv4 address in dotted decimal, the only form browsers send`},
 		{"origin with a fragment", "BYWARD_ALLOWED_ORIGINS=https://app.example.com#", `is not an origin (scheme://host[:port]): it has a query or a fragment`},
 		{"origin with an empty query", "BYWARD_ALLOWED_ORIGINS=https://app.example.com?", `is not an origin (scheme://host[:port]): it has a query or a fragment`},
 		{"unicode allowed host", "BYWARD_ALLOWED_HOSTS=bücher.example:8443", `BYWARD_ALLOWED_HOSTS: the host "bücher.example:8443" is not ASCII`},
@@ -936,26 +939,30 @@ func TestAnAllowedHostNameRefusesEveryCharacterAHostNameCannotHave(t *testing.T)
 	}
 }
 
-// #344: every host setting that follows the name rule still loads underscores, xn-- names and
-// mixed case, each on its own, stored in lower case where the setting stores it so.
+// #344: every host list that follows the name rule loads underscores, xn-- names and mixed case,
+// each on its own, stored in lower case except in the denylist, which keeps entries as given. The
+// public URL refuses upper case (#472), so it loads only the lower-case names, each as its issuer.
 func TestHostSettingsLoadUnderscoresIDNANamesAndMixedCase(t *testing.T) {
 	for _, host := range []string{"my_svc.example", "xn--bcher-kva.example", "Mixed-Case.Example"} {
 		lower := strings.ToLower(host)
-		for setting, stored := range map[string]func(*Config) []string{
-			"BYWARD_PUBLIC_URL=https://" + host + "/mcp": func(c *Config) []string { return []string{c.PublicURL.Hostname()} },
-			"BYWARD_CIMD_TRUSTED_HOSTS=" + host:          func(c *Config) []string { return c.CIMDTrustedHosts },
-			"BYWARD_CIMD_ALLOWED_HOSTS=" + host:          func(c *Config) []string { return c.CIMDAllowedHosts },
-			"BYWARD_ALLOWED_HOSTS=" + host:               func(c *Config) []string { return c.AllowedHosts },
-			"BYWARD_CLIENT_DENYLIST=" + host:             func(c *Config) []string { return c.ClientDenylist },
-		} {
+		settings := map[string]func(*Config) []string{
+			"BYWARD_CIMD_TRUSTED_HOSTS=" + host: func(c *Config) []string { return c.CIMDTrustedHosts },
+			"BYWARD_CIMD_ALLOWED_HOSTS=" + host: func(c *Config) []string { return c.CIMDAllowedHosts },
+			"BYWARD_ALLOWED_HOSTS=" + host:      func(c *Config) []string { return c.AllowedHosts },
+			"BYWARD_CLIENT_DENYLIST=" + host:    func(c *Config) []string { return c.ClientDenylist },
+		}
+		if host == lower {
+			settings["BYWARD_PUBLIC_URL=https://"+host+"/mcp"] = func(c *Config) []string { return []string{strings.TrimPrefix(c.Issuer(), "https://")} }
+		}
+		for setting, stored := range settings {
 			t.Run(setting, func(t *testing.T) {
 				c, err := load(t, nil, setting)
 				if err != nil {
 					t.Fatal(err)
 				}
 				want := lower
-				if strings.HasPrefix(setting, "BYWARD_PUBLIC_URL=") || strings.HasPrefix(setting, "BYWARD_CLIENT_DENYLIST=") {
-					want = host // url.Parse keeps the host as given; the denylist keeps its entries as given
+				if strings.HasPrefix(setting, "BYWARD_CLIENT_DENYLIST=") {
+					want = host // the denylist keeps its entries as given
 				}
 				if got := stored(c); !slices.Equal(got, []string{want}) {
 					t.Errorf("stored %v, want [%s]", got, want)

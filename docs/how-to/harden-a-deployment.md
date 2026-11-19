@@ -93,9 +93,10 @@ Both checks run before authentication ([ADR-0018](../adr/0018-hardening.md) ยง1โ
         [static clients file](../reference/static-clients.md);
       - static client secrets must be at least 32 bytes.
 
-      An inline secret refuses to start unless `--dev` is set. So does a secret file that its group
-      or others can read or write (mode `0600` or `0400`, owned by the proxy's user), unless it is
-      on a read-only mount such as a Kubernetes secret volume (default mode `0644`).
+      An inline secret refuses to start unless `--dev` is set. So does a secret file with any
+      permission for its group or others (make it mode `0600` or `0400`, owned by the proxy's
+      user), unless it is on a read-only mount such as a Kubernetes secret volume (default mode
+      `0644`).
       - Docker Compose: use `secrets:` (Compose mounts those read-only) or a volume with `:ro`, e.g.
         `./entra-secret:/run/secrets/entra:ro`. A host file at `0600` owned by your user cannot be
         read by the image's uid 65532, and `chmod 644` without `:ro` is refused.
@@ -166,7 +167,7 @@ For Google, Okta, Keycloak, Auth0 or another OpenID Connect IdP ([OIDC how-to](o
       over another user's grants by changing it.
 - [ ] **An ID token on refresh.** The gate is checked again at every refresh, so the IdP must return
       an ID token then; a refresh without one ends the grant ([OIDC how-to](oidc.md)).
-- [ ] Run `byward doctor`: it checks discovery and the issuer, and (on `main`) that the IdP accepts
+- [ ] Run `byward doctor`: it checks discovery and the issuer, and (since v0.3.0) that the IdP accepts
       the client ID and the secret or key.
 
 ## The internal listener
@@ -190,8 +191,8 @@ plus the names in `BYWARD_ALLOWED_HOSTS`; any other name gets `421`, which stops
       `-wal` and `-shm` files), mode 0600 in a 0700 directory ([state](state.md)). Grants, refresh
       tokens and revocations survive a restart; the revocation list is reloaded from the store before
       the proxy serves.
-- [ ] **One replica on SQLite.** For several, use the PostgreSQL store (on `main`,
-      [postgres](postgres.md)); a stdio upstream stays on one replica, and the proxy refuses to start
+- [ ] **One replica on SQLite.** For several, use the PostgreSQL store
+      ([postgres](postgres.md)); a stdio upstream stays on one replica, and the proxy refuses to start
       with a stdio upstream and PostgreSQL. With PostgreSQL:
       - give the connection string as a file (`BYWARD_STORE_POSTGRES_DSN_FILE`, mode `0600`), with
         `sslmode=verify-full`;
