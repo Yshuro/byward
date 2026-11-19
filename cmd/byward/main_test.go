@@ -56,6 +56,13 @@ func authEnv(t *testing.T) []string {
 		"BYWARD_STORE_DIR=" + filepath.Join(dir, "state"), "BYWARD_ASSERTION_KEYS_DIR=" + assertionkey.Dir(t)}
 }
 
+// stdioAuthEnv is authEnv without BYWARD_ASSERTION_KEYS_DIR, which config refuses with a stdio
+// upstream.
+func stdioAuthEnv(t *testing.T) []string {
+	t.Helper()
+	return slices.DeleteFunc(authEnv(t), func(kv string) bool { return strings.HasPrefix(kv, "BYWARD_ASSERTION_KEYS_DIR=") })
+}
+
 func TestAnUnknownSettingIsAConfigErrorWithADidYouMeanHint(t *testing.T) {
 	code, _, stderr := runWith(nil, "BYWARD_PUBLC_URL=x")
 	if code != exitConfig || !strings.HasPrefix(stderr, "byward: configuration error: unknown setting BYWARD_PUBLC_URL") ||
@@ -140,8 +147,7 @@ func TestAURLSettingsQueryIsNeverPrintedInTheConfiguration(t *testing.T) {
 // arguments follow, never the arguments, one of which can be a token; the release note says so.
 func TestTheUpstreamCommandsArgumentsAreNeverPrintedInTheConfiguration(t *testing.T) {
 	const token = "S3CRET-token"
-	env := append(authEnv(t), "BYWARD_PUBLIC_URL=https://m.example/mcp", "BYWARD_LISTEN=127.0.0.1:0", "BYWARD_INTERNAL_LISTEN=127.0.0.1:0",
-		"BYWARD_ASSERTION_KEYS_DIR=") // a stdio upstream takes no assertion keys
+	env := append(stdioAuthEnv(t), "BYWARD_PUBLIC_URL=https://m.example/mcp", "BYWARD_LISTEN=127.0.0.1:0", "BYWARD_INTERNAL_LISTEN=127.0.0.1:0")
 	args := []string{"--", "/bin/cat", "--token", token}
 	code, stdout, stderr := runWith(append([]string{"--print-config"}, args...), env...)
 	if want := "BYWARD_UPSTREAM_COMMAND=/bin/cat (2 arguments not shown) (flag)\n"; code != exitOK || !strings.Contains(stdout, want) || strings.Contains(stdout+stderr, token) {
@@ -475,8 +481,8 @@ func TestRevokeAndNewEpochTakeAStdioUpstreamAfterDashes(t *testing.T) {
 			if err := os.WriteFile(script, []byte("#!/bin/sh\ntouch "+dir+"/ran\n"), 0o700); err != nil { //nolint:gosec // G306: an executable test command
 				t.Fatal(err)
 			}
-			env := slices.DeleteFunc(authEnv(t), func(kv string) bool { return strings.HasPrefix(kv, "BYWARD_ASSERTION_KEYS_DIR=") }) // refused with a stdio upstream
-			env = append(env, "BYWARD_PUBLIC_URL=https://m.example/mcp", "BYWARD_DATA_DIR="+dir,                                      // the test's own, so no defaulted path reaches the host's
+			env := stdioAuthEnv(t)
+			env = append(env, "BYWARD_PUBLIC_URL=https://m.example/mcp", "BYWARD_DATA_DIR="+dir, // the test's own, so no defaulted path reaches the host's
 				"BYWARD_STORE_COUNTER_FILE="+filepath.Join(dir, "store-writes"))
 			if tc.code == exitOK { // a revocation needs the store a proxy created (L152)
 				s, err := sqlite.Open(context.Background(), sqlite.Options{Dir: setting(env, "BYWARD_STORE_DIR"), CounterFile: setting(env, "BYWARD_STORE_COUNTER_FILE")})

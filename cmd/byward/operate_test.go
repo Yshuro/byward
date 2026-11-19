@@ -422,8 +422,8 @@ func TestCheckOfflineAndDoctorTakeAStdioUpstreamAfterDashes(t *testing.T) {
 		t.Fatal(err)
 	}
 	useFakes(t, refusing{})
-	stdioAuth := slices.DeleteFunc(authEnv(t), func(kv string) bool { return strings.HasPrefix(kv, "BYWARD_ASSERTION_KEYS_DIR=") }) // refused with a stdio upstream
-	env := append(stdioAuth, "BYWARD_PUBLIC_URL=https://m.example/mcp", "BYWARD_DATA_DIR="+dir)                                     // the test's own, so no default path reaches the host's
+	stdioAuth := stdioAuthEnv(t)
+	env := append(stdioAuth, "BYWARD_PUBLIC_URL=https://m.example/mcp", "BYWARD_DATA_DIR="+dir) // the test's own, so no default path reaches the host's
 	code, stdout, stderr := runWith([]string{"check", "--offline", "--", script, "--flag"}, env...)
 	if code != exitOK || !strings.Contains(stdout, "configuration OK") {
 		t.Fatalf("check: code %d stdout %q stderr %q", code, stdout, stderr)
@@ -451,23 +451,35 @@ func TestJWKSPrintsThePublicKeysOnly(t *testing.T) {
 	}
 }
 
-// `byward jwks` with no key, with an argument it does not take, or without authentication, prints
-// nothing and exits 2.
-func TestJWKSRefusesNoKeysAnExtraArgumentOrNoAuthentication(t *testing.T) {
+// `byward jwks` with no key, with an argument it does not take, without authentication or with a
+// stdio upstream, prints nothing and exits 2.
+func TestJWKSRefusesNoKeysAnExtraArgumentNoAuthenticationOrAStdioUpstream(t *testing.T) {
 	env := append(authEnv(t), "BYWARD_PUBLIC_URL=https://m.example/mcp", "BYWARD_UPSTREAM_URL=http://u/mcp")
+	// A stdio upstream with a key in its default key directory, which a jwks that read it would print
+	// (#429), and one with no key directory, which a jwks that read it would name.
+	withKey, noKeyDir := t.TempDir(), t.TempDir()
+	assertionkey.Write(t, withKey+"/assertion-keys", "k1", false)
+	stdio := append(stdioAuthEnv(t), "BYWARD_PUBLIC_URL=https://m.example/mcp", `BYWARD_UPSTREAM_COMMAND=["/bin/cat"]`)
+	noAuth := []string{"BYWARD_INSECURE_NO_AUTH=true", "BYWARD_PUBLIC_URL=http://127.0.0.1:8080/mcp"}
+	const noAuthRefusal = "byward: configuration error: with BYWARD_INSECURE_NO_AUTH no identity assertion is sent, so there are no assertion keys to export\n"
+	const stdioRefusal = "byward: configuration error: with a stdio upstream (BYWARD_UPSTREAM_COMMAND) no identity assertion is sent, so there are no assertion keys to export; only an HTTP upstream gets one\n"
 	for _, tc := range []struct {
 		name     string
 		args     []string
 		env      []string
 		inStderr []string
 	}{
-		{"no keys", []string{"jwks"}, append(env, "BYWARD_ASSERTION_KEYS_DIR="+assertionkey.EmptyDir(t)), []string{"BYWARD_ASSERTION_KEYS_DIR", "has no key files"}},
+		{"no keys", []string{"jwks"}, append(slices.Clone(env), "BYWARD_ASSERTION_KEYS_DIR="+assertionkey.EmptyDir(t)), []string{"BYWARD_ASSERTION_KEYS_DIR", "has no key files", "(see docs/how-to/identity-assertion.md)"}},
 		{"extra argument", []string{"jwks", "--out", "x"}, env, []string{"usage: byward jwks"}},
 		// Without authentication no identity assertion is sent: refused as such, not as a key
 		// directory that cannot be read (L175).
-		{"without authentication", []string{"jwks"},
-			[]string{"BYWARD_INSECURE_NO_AUTH=true", "BYWARD_PUBLIC_URL=http://127.0.0.1:8080/mcp", "BYWARD_UPSTREAM_URL=http://127.0.0.1:9/mcp"},
-			[]string{"byward: configuration error: with BYWARD_INSECURE_NO_AUTH no identity assertion is sent, so there are no assertion keys to export\n"}},
+		{"without authentication", []string{"jwks"}, append(slices.Clone(noAuth), "BYWARD_UPSTREAM_URL=http://127.0.0.1:9/mcp"), []string{noAuthRefusal}},
+		// A stdio upstream gets no identity assertion (ADR-0016 §2): refused as such, before the
+		// key directory is read, whether it holds a key or does not exist.
+		{"stdio upstream, a key in the default directory", []string{"jwks"}, append(slices.Clone(stdio), "BYWARD_DATA_DIR="+withKey), []string{stdioRefusal}},
+		{"stdio upstream, no key directory", []string{"jwks"}, append(slices.Clone(stdio), "BYWARD_DATA_DIR="+noKeyDir), []string{stdioRefusal}},
+		// Both: refused as no authentication, as revoke-user, revoke-all and store new-epoch are.
+		{"stdio upstream without authentication", []string{"jwks"}, append(slices.Clone(noAuth), `BYWARD_UPSTREAM_COMMAND=["/bin/cat"]`), []string{noAuthRefusal}},
 	} {
 		code, stdout, stderr := runWith(tc.args, tc.env...)
 		if code != exitConfig || stdout != "" {
