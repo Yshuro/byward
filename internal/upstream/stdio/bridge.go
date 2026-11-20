@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/byward-dev/byward/internal/logging"
 	"github.com/byward-dev/byward/internal/shutdown"
 )
 
@@ -418,7 +419,7 @@ func (s *session) request(w http.ResponseWriter, r *http.Request, msg []byte, id
 			if initialize {
 				w.Header().Set(sessionHeader, s.key)
 			}
-			started := startSSE(w)
+			started := startSSE(r.Context(), w)
 			out = &started
 		}
 	}
@@ -489,9 +490,12 @@ func (s *session) request(w http.ResponseWriter, r *http.Request, msg []byte, id
 			// A disconnect is not a cancellation (2025-11-25 transports); the request stays with the
 			// upstream, and its response, when it comes, is dropped. A request whose stream has not
 			// started still records why it ended (shutdown.AnswerIfEnded); one whose stream has, keeps
-			// the status it sent.
+			// the status it sent and is recorded as cut off (#533).
 			s.dropPost(st)
-			if out != nil || shutdown.AnswerIfEnded(w, r) {
+			if out != nil {
+				logging.StreamEnded(r.Context())
+				reason = requestEnded
+			} else if shutdown.AnswerIfEnded(w, r) {
 				reason = requestEnded
 			}
 			return
@@ -501,7 +505,8 @@ func (s *session) request(w http.ResponseWriter, r *http.Request, msg []byte, id
 
 // listen serves the session's GET stream until the client leaves, the session ends or a newer GET
 // replaces it. Each message goes out on one stream only (2025-11-25 transports, Multiple
-// Connections), so the newest GET stream is the one used.
+// Connections), so the newest GET stream is the one used. A stream its request's end cut off is
+// recorded as such (#533), as is one a write to failed (sse).
 func (s *session) listen(w http.ResponseWriter, r *http.Request) {
 	st := newStream(nil)
 	if !s.setListen(st) {
@@ -512,7 +517,7 @@ func (s *session) listen(w http.ResponseWriter, r *http.Request) {
 	// Before the stream starts, so a client that sees it start already has a running timer.
 	q := newQuiet(s.p.clock)
 	defer q.stop()
-	sse := startSSE(w)
+	sse := startSSE(r.Context(), w)
 	for {
 		select {
 		case m := <-st.out:
@@ -530,6 +535,7 @@ func (s *session) listen(w http.ResponseWriter, r *http.Request) {
 		case <-st.done:
 			return
 		case <-r.Context().Done():
+			logging.StreamEnded(r.Context())
 			return
 		}
 	}

@@ -1,7 +1,9 @@
 // Package logging builds the proxy's slog logger: an allowlist of attribute keys, redaction of
 // bearer-shaped values, UTC timestamps, and a request ID per request (ADR-0021). It also holds how
 // logs and error messages may show what can carry a secret: URL (and MarkedURL for a URL setting)
-// for a URL, Quote for an operator's value, and FileError for a file's error, never its path.
+// for a URL, Quote for an operator's value, and FileError for a file's error, never its path. And it
+// observes each request for the request line, the request metric and the server span: the status it
+// sent and, for a response cut off after its headers, why (Observe, CutOff).
 package logging
 
 import (
@@ -30,6 +32,8 @@ var allowed = map[string]bool{
 	slog.TimeKey: true, slog.LevelKey: true, slog.MessageKey: true,
 	requestIDKey: true, "method": true, "path": true, "status": true, "duration_ms": true,
 	"mcp_method": true, "remote_ip": true, "host": true, "origin": true, "reason": true,
+	// Why a response was cut off after its headers: one of the CutOff causes.
+	"error_type": true,
 	// On-Behalf-Of (ADR-0017 §5): where an administrator grants consent; no secret in it.
 	"admin_consent_url": true,
 	"error":             true, "listen": true, "version": true, "relaxation": true,
@@ -199,8 +203,9 @@ func newRequestID() string {
 	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
 }
 
-// Middleware gives each request an ID and logs one line per request. The query string is never
-// logged; neither are headers, except the `Mcp-Method` value.
+// Middleware gives each request an ID and logs one line per request, a response cut off after its
+// headers included, with its error_type (Observe). The query string is never logged; neither are
+// headers, except the `Mcp-Method` value.
 func Middleware(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -208,44 +213,47 @@ func Middleware(log *slog.Logger, next http.Handler) http.Handler {
 		r = r.WithContext(WithRequestID(r.Context(), id))
 		// Echoed so users and operators can quote it; inbound IDs are not trusted (no trusted proxies yet).
 		w.Header().Set("X-Request-Id", id)
-		rec := NewStatusRecorder(w)
-		next.ServeHTTP(rec, r)
-		// The ID is set here, not left to New's handler, so the request line has it whatever
-		// logger it is given.
-		attrs := []any{requestIDKey, id, "method", r.Method, "path", r.URL.Path, "status", rec.Status(),
-			"duration_ms", time.Since(start).Milliseconds(), "remote_ip", RemoteIP(r)}
-		if m := r.Header.Get("Mcp-Method"); m != "" {
-			attrs = append(attrs, "mcp_method", m)
-		}
-		log.InfoContext(r.Context(), "request", attrs...)
+		Observe(w, r, next, func(status int, cut CutOff) {
+			// The ID is set here, not left to New's handler, so the request line has it whatever
+			// logger it is given.
+			attrs := []any{requestIDKey, id, "method", r.Method, "path", r.URL.Path, "status", status,
+				"duration_ms", time.Since(start).Milliseconds(), "remote_ip", RemoteIP(r)}
+			if m := r.Header.Get("Mcp-Method"); m != "" {
+				attrs = append(attrs, "mcp_method", m)
+			}
+			if cut != "" {
+				attrs = append(attrs, "error_type", string(cut))
+			}
+			log.InfoContext(r.Context(), "request", attrs...)
+		})
 	})
 }
 
-// StatusRecorder records the final status a handler writes (200 if it writes none). The request
-// log, metrics and server spans all read the status through it.
-type StatusRecorder struct {
+// statusRecorder records the final status a handler writes (200 if it writes none). The request
+// log, metrics and server spans all read the status through it, by Observe.
+type statusRecorder struct {
 	http.ResponseWriter
 	status      int
 	wroteHeader bool
 }
 
-// NewStatusRecorder wraps w.
-func NewStatusRecorder(w http.ResponseWriter) *StatusRecorder {
-	return &StatusRecorder{ResponseWriter: w, status: http.StatusOK}
+// newStatusRecorder wraps w.
+func newStatusRecorder(w http.ResponseWriter) *statusRecorder {
+	return &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 }
 
 // Status is the final status written so far.
-func (s *StatusRecorder) Status() int { return s.status }
+func (s *statusRecorder) Status() int { return s.status }
 
 // WriteHeader records code. 1xx informational responses (other than 101) precede the final status.
-func (s *StatusRecorder) WriteHeader(code int) {
+func (s *statusRecorder) WriteHeader(code int) {
 	if !s.wroteHeader && (code < 100 || code > 199 || code == http.StatusSwitchingProtocols) {
 		s.status, s.wroteHeader = code, true
 	}
 	s.ResponseWriter.WriteHeader(code)
 }
 
-func (s *StatusRecorder) Write(b []byte) (int, error) {
+func (s *statusRecorder) Write(b []byte) (int, error) {
 	s.wroteHeader = true
 	return s.ResponseWriter.Write(b)
 }
@@ -253,4 +261,4 @@ func (s *StatusRecorder) Write(b []byte) (int, error) {
 // Unwrap lets http.ResponseController reach the underlying writer: flush, deadlines, and the relay's
 // full duplex, without which a stream the upstream starts before the request body ends is held back
 // or cut (#527).
-func (s *StatusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }

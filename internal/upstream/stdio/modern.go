@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/byward-dev/byward/internal/logging"
 	"github.com/byward-dev/byward/internal/shutdown"
 )
 
@@ -408,8 +409,8 @@ func (c *userConn) request(w http.ResponseWriter, r *http.Request, msg []byte, l
 		draining = c.draining
 	}
 	defer silence.stop()
-	out := startSSE(w)
-	drain := func() { // what the upstream sent before the end goes out first
+	out := startSSE(r.Context(), w) // a write that fails records the stream as cut off (#533)
+	drain := func() {               // what the upstream sent before the end goes out first
 		for {
 			select {
 			case o := <-q.out:
@@ -452,9 +453,10 @@ func (c *userConn) request(w http.ResponseWriter, r *http.Request, msg []byte, l
 			return
 		case <-r.Context().Done():
 			if q.listen && shutdown.ShuttingDown(r.Context()) { // shutdown cancels the request; the listen still ends cleanly
-				endListen()
+				endListen() // with its completion result: not cut off (#533)
 				return
 			}
+			logging.StreamEnded(r.Context())
 			c.cancel(q) // closing the stream cancels the request (2026-07-28 transports)
 			return
 		}

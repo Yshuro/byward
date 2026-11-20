@@ -90,7 +90,7 @@ func TestLabelsCarryOnlyFixedValuesAndBucketsAreFixed(t *testing.T) {
 		}
 	}
 	for _, le := range []string{`le="0.05"`, `le="0.1"`, `le="0.25"`, `le="0.5"`, `le="1"`, `le="2.5"`, `le="5"`, `le="10"`, `le="+Inf"`} {
-		if !strings.Contains(out, `byward_http_request_duration_seconds_bucket{route="mcp",status_class="4xx",`+le+`}`) {
+		if !strings.Contains(out, `byward_http_request_duration_seconds_bucket{error_type="",route="mcp",status_class="4xx",`+le+`}`) {
 			t.Fatalf("bucket %s missing: %s", le, out)
 		}
 	}
@@ -152,5 +152,27 @@ func TestUpstreamRefusalsAreCountedByStatusFromZero(t *testing.T) {
 		if !strings.Contains(after, want) {
 			t.Fatalf("after two 403s, want %s in\n%s", want, after)
 		}
+	}
+}
+
+// A response cut off after its headers is observed once, with the status class it sent and why, and
+// the abort goes on to the server (#533). Every other request has an empty error_type.
+func TestARequestCutOffAfterItsHeadersIsObservedWithWhy(t *testing.T) {
+	m := New()
+	h := m.Middleware(func(*http.Request) string { return "mcp" }, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("data: one\n\n"))
+		panic(http.ErrAbortHandler)
+	}))
+	func() {
+		defer func() {
+			if p := recover(); p != http.ErrAbortHandler { //nolint:errorlint // sentinel compared as net/http does
+				t.Errorf("panic %v; want http.ErrAbortHandler to go on to the server", p)
+			}
+		}()
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/mcp", nil))
+	}()
+	const want = `byward_http_request_duration_seconds_count{error_type="upstream_aborted",route="mcp",status_class="2xx"} 1` + "\n"
+	if out := scrape(t, m); !strings.Contains(out, want) {
+		t.Fatalf("metrics lack %s:\n%s", want, out)
 	}
 }
