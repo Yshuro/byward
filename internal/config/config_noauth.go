@@ -3,10 +3,9 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"strings"
-
-	"github.com/byward-dev/byward/internal/logging"
 )
 
 // inContainer reports whether the proxy runs in a container (Docker or Podman marker file) that
@@ -84,23 +83,32 @@ func checkNoAuth(c *Config, v *Values) []error {
 	case isLoopback(host):
 	case c.InContainer:
 		// The host port is the public URL's; the container port is the listen address's.
-		hostPort := c.PublicURL.Port()
-		if hostPort == "" {
-			hostPort = map[string]string{"http": "80", "https": "443"}[c.PublicURL.Scheme]
+		publishPort := c.PublicURL.Port()
+		if publishPort == "" {
+			publishPort = map[string]string{"http": "80", "https": "443"}[c.PublicURL.Scheme]
 		}
 		c.Relaxations = append(c.Relaxations, fmt.Sprintf(
-			"listening on %s inside a container: publish the port on loopback only, e.g. docker run -p 127.0.0.1:%s:%s; anyone who can reach the published port can use the upstream", c.Listen, hostPort, port))
+			"listening on %s inside a container: publish the port on loopback only, e.g. docker run -p 127.0.0.1:%s:%s; anyone who can reach the published port can use the upstream", c.Listen, publishPort, port))
 	default:
 		errs = append(errs, errorf("%s: BYWARD_LISTEN must be a loopback address such as 127.0.0.1:8080 (non-loopback only inside a container with its own network, not --network host)", env))
 	}
-	for _, h := range splitList(v.get("allowed-hosts")) { // as written, for the message; checked in its stored form
-		if n, err := normalizeAllowedHost(h); err == nil && !isLoopback(Hostname(n)) {
-			errs = append(errs, errorf("%s: BYWARD_ALLOWED_HOSTS may only list loopback hosts, got %q", env, h))
+	hosts, origins := v.value("allowed-hosts").Setting, v.value("allowed-origins").Setting
+	// Named without a place: the stored lists leave out an entry refused for its form, so an index
+	// into them need not be the entry's place in the list given.
+	for _, h := range c.AllowedHosts {
+		if host := Hostname(h); !isLoopback(host) {
+			errs = append(errs, refusedMeaning(hosts, whole, notLoopback(host),
+				"only loopback hosts with "+env+", such as localhost:8080", "authentication is off, so only loopback may reach the proxy"))
 		}
 	}
 	for _, o := range c.AllowedOrigins {
 		if u, err := url.Parse(o); err != nil || !isLoopback(u.Hostname()) {
-			errs = append(errs, errorf("%s: BYWARD_ALLOWED_ORIGINS may only list loopback origins, got %q", env, o))
+			host := ""
+			if err == nil {
+				host = u.Hostname()
+			}
+			errs = append(errs, refusedMeaning(origins, whole, notLoopback(host),
+				"only loopback origins with "+env+", such as http://localhost:3000", "authentication is off, so only loopback may reach the proxy"))
 		}
 	}
 	for _, val := range v.Effective() {
@@ -109,7 +117,17 @@ func checkNoAuth(c *Config, v *Values) []error {
 		}
 	}
 	if len(errs) == 0 {
-		c.Relaxations = append(c.Relaxations, "AUTHENTICATION IS OFF: anyone who can reach "+logging.MarkedURL(c.PublicURL.String())+" can use the upstream, and the upstream receives no identity")
+		c.Relaxations = append(c.Relaxations, "AUTHENTICATION IS OFF: anyone who can reach "+v.display("public-url")+" can use the upstream, and the upstream receives no identity")
 	}
 	return errs
+}
+
+// notLoopback is what a no-auth refusal shows of a stored host that is not loopback (ADR-0031 §1): an
+// IP address as netip writes it, which carries nothing but the address, and a host name never, since a
+// token is a valid host name.
+func notLoopback(host string) string {
+	if a, err := netip.ParseAddr(host); err == nil {
+		return "the address " + a.String()
+	}
+	return "a host name, not shown"
 }
