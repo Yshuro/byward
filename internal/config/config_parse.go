@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/byward-dev/byward/internal/host"
 	"github.com/byward-dev/byward/internal/ratelimit"
 )
 
@@ -30,7 +31,7 @@ func checkInlineSecrets(v *Values, dev bool) (relaxation string, err error) {
 // absolute, an ASCII host[:port] that BYWARD_ALLOWED_HOSTS would accept (hostPort: an IP address or a
 // name following validHostName's rule, a port from 1 to 65535 without a leading zero, no IPv6 zone),
 // no host ending in a number unless it is an IPv4 address in dotted decimal (browserIPv4), an IPv6
-// address or a host name only in the form browsers write it (browserHost: a name in lower case), a
+// address or a host name only in the form browsers write it (host.Serialize: a name in lower case), a
 // path without a trailing slash, no query or fragment, and https unless the host is loopback (which
 // the proxy itself accepts only with --dev). A refusal never shows the value as given (ADR-0031 §1),
 // nor its host: a token is a valid host name. It shows an IP address only as browsers would write it.
@@ -57,7 +58,7 @@ func ParsePublicURL(raw string) (*url.URL, error) {
 	if reason := browserIPv4(h); reason != "" {
 		// A browser never sends such a host back, so its sign-in could never finish.
 		errs = append(errs, refusedForm(s, whole, raw, want, "its host "+reason).Error())
-	} else if bh := browserHost(h); strings.Contains(h, ":") && "["+h+"]" != bh {
+	} else if bh := host.Serialize(h); strings.Contains(h, ":") && "["+h+"]" != bh {
 		// The public URL is also the issuer, the resource and the IdP redirect URI, which browser
 		// clients compare with the URL they hold, in the form they write (#447).
 		errs = append(errs, refusedForm(s, whole, raw, wantBrowserHost, "its IPv6 address is not in the form browsers write it; write it as "+bh).Error())
@@ -75,7 +76,7 @@ func ParsePublicURL(raw string) (*url.URL, error) {
 		errs = append(errs, refusedMeaning(s, whole, "a query or fragment, not shown", "a URL without a query or fragment", "remove it").Error())
 	}
 	// LOCALHOST is loopback too; the host name rule above already refuses its spelling.
-	if u.Scheme == "http" && !isLoopback(strings.ToLower(h)) {
+	if u.Scheme == "http" && !host.LoopbackAsWritten(h) {
 		errs = append(errs, refusedMeaning(s, whole, "http", "https (http only on a loopback host, with --dev)", "give https, or a loopback host").Error())
 	}
 	if len(errs) > 0 {
@@ -294,7 +295,7 @@ func notASCII(s string) bool { return strings.ContainsFunc(s, func(r rune) bool 
 const hostPortForms = "give host, host:port, an IPv6 address, [IPv6] or [IPv6]:port, with a port from 1 to 65535 and no IPv6 zone"
 
 // hostPort is a BYWARD_ALLOWED_HOSTS entry, or BYWARD_PUBLIC_URL's host:port, which joins the same
-// list, as the public listener compares it with a Host header (CanonicalHost): in lower case, an IPv4
+// list, as the public listener compares it with a Host header (host.Canonical): in lower case, an IPv4
 // address in dotted decimal (127.1 is 127.0.0.1), and an IPv6 address in brackets in its shortest
 // form. It refuses any form a Host header cannot carry, since such an entry could never match there,
 // with a fixed reason that completes "it …" and never repeats the entry.
@@ -342,7 +343,7 @@ func hostPort(h string) (stored, reason string) {
 			return "", "has a port that is not a number from 1 to 65535 without a sign or leading zero"
 		}
 	}
-	return CanonicalHost(stored), ""
+	return host.Canonical(stored), ""
 }
 
 // parseAllowedHosts reads BYWARD_ALLOWED_HOSTS (#323, #325): each entry as hostPort stores it.
@@ -408,25 +409,4 @@ const hostNameRule = "a host name has only letters, digits and - . _ ~, and no e
 func validHostName(host string) bool {
 	return host != "" && strings.Trim(host, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~") == "" &&
 		!strings.HasPrefix(host, ".") && !strings.HasSuffix(host, ".") && !strings.Contains(host, "..")
-}
-
-// Hostname is a host as BYWARD_ALLOWED_HOSTS lists it or a Host header carries it (host,
-// host:port, [v6], [v6]:port or a bare v6 address) reduced to its host name: no port, no
-// brackets, in lower case. The internal listener's Host check, the no-auth loopback check and
-// doctor's TLS certificate names use it, so they agree; the public listener's Host check compares
-// host:port instead (origin.Hosts).
-func Hostname(hostport string) string {
-	h := hostport
-	if name, _, err := net.SplitHostPort(h); err == nil {
-		h = name
-	}
-	return strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(h, "["), "]"))
-}
-
-func isLoopback(host string) bool {
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
 }

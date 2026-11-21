@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+
+	"github.com/byward-dev/byward/internal/host"
 )
 
 // Denylist is the operator's list of refused CIMD clients and redirect hosts (ADR-0008 §9). It
@@ -16,7 +18,7 @@ type Denylist struct {
 }
 
 // NewDenylist parses entries: a CIMD client ID (an https URL) or a host name that redirect URIs
-// must not return to. Both match exactly up to spelling: the host's spelling (BrowserHost: case, a
+// must not return to. Both match exactly up to spelling: the host's spelling (host.BrowserName: case, a
 // trailing dot, a full-width or internationalized name by its ASCII form), and for a URL the default
 // port and percent-encoding in the path. A redirect host also matches by its transitional fold
 // (DeniesRedirect).
@@ -36,7 +38,7 @@ func NewDenylist(entries []string) (*Denylist, error) {
 			}
 			d.urls[canonicalCIMD(e)] = true
 		case e != "" && !strings.ContainsAny(e, "/:@*? ") && strings.Contains(e, "."):
-			d.hosts[BrowserHost(e)] = true
+			d.hosts[host.BrowserName(e)] = true
 		default:
 			return nil, &EntryError{Index: i, Reason: "it is neither a CIMD client ID (https URL) nor a host name"}
 		}
@@ -72,16 +74,16 @@ func (d *Denylist) DeniesRedirect(redirectURI string) bool {
 		return false
 	}
 	h := u.Hostname()
-	return d.hosts[BrowserHost(h)] || d.hosts[transitionalHost(h)]
+	return d.hosts[host.BrowserName(h)] || d.hosts[transitionalHost(h)]
 }
 
 // canonicalCIMD folds the spellings of one CIMD URL that fetch the same document: the host's
-// spelling (BrowserHost), the default port and percent-encoding in the path. A denylist may match more
+// spelling (host.BrowserName), the default port and percent-encoding in the path. A denylist may match more
 // than one spelling, never fewer.
 func canonicalCIMD(id string) string {
 	u, err := url.Parse(id)
 	if err != nil {
 		return id
 	}
-	return "https://" + BrowserHost(u.Hostname()) + u.Path
+	return "https://" + host.BrowserName(u.Hostname()) + u.Path
 }

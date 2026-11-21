@@ -305,7 +305,9 @@ func TestEachWayOfReadingAURLIsCaught(t *testing.T) {
 		{name: "a URL's UnmarshalBinary method", code: `func f() { u.UnmarshalBinary(b) }`, want: urlReads{unfollowed: []string{"f calls u.UnmarshalBinary, a URL method: read the URL with url.Parse, where its argument can be listed"}}},
 		{name: "a URL method taken as a value", imports: `"net/url"`, code: `func f() { p := new(url.URL).Parse; p(raw) }`, want: urlReads{unfollowed: []string{"f takes new(url.URL).Parse as a value; call it where its argument can be listed"}}},
 		{name: "a URL method expression", imports: `"net/url"`, code: `func f() { (*url.URL).Parse(base, raw) }`, want: urlReads{unfollowed: []string{"f calls (*url.URL).Parse, a URL method: read the URL with url.Parse, where its argument can be listed"}}},
-		{name: "the other parsers are not URL reads", imports: `"time"; "strconv"; "net"; "net/netip"`, code: `func f() { time.ParseDuration(s); strconv.ParseBool(s); net.ParseIP(s); netip.ParsePrefix(s); fs.Parse(args) }`},
+		{name: "the other parsers are not URL reads", imports: `"time"; "strconv"; "net"; "net/netip"; "github.com/byward-dev/byward/internal/host"`, code: `func f() { time.ParseDuration(s); strconv.ParseBool(s); net.ParseIP(s); netip.ParsePrefix(s); fs.Parse(args); host.ParseIPv4(s); host.Parse(s, "") }`},
+		{name: "internal/host under another import name", imports: `h "github.com/byward-dev/byward/internal/host"`, code: `func f() { h.Parse(s, ""); host.ResolveReference(ref) }`, want: urlReads{unfollowed: []string{"f calls host.ResolveReference, a URL method: read the URL with url.Parse, where its argument can be listed"}}},
+		{name: "a URL named host, in a file that does not import internal/host", code: `func f() { host.ResolveReference(ref) }`, want: urlReads{unfollowed: []string{"f calls host.ResolveReference, a URL method: read the URL with url.Parse, where its argument can be listed"}}},
 		{name: "a file that does not import net/url has no url.Parse", code: `func f() { url.Parse(raw) }`, want: urlReads{unfollowed: []string{"f calls url.Parse, a URL method: read the URL with url.Parse, where its argument can be listed"}}},
 	}
 	for _, c := range cases {
@@ -337,19 +339,25 @@ type urlReads struct {
 // argument is unfollowed: url.Parse or parseURL taken as a value, parseURL with a name that is not a
 // literal, or a URL method (Parse*, JoinPath, ResolveReference, UnmarshalBinary) called or taken as a
 // value on anything but the packages config parses other values with (time, netip, net, strconv,
-// and its flag set fs).
+// internal/host, and its flag set fs).
 func urlReadsOf(name string, src any) (urlReads, error) {
 	var reads urlReads
 	file, err := parser.ParseFile(token.NewFileSet(), name, src, 0)
 	if err != nil {
 		return reads, err
 	}
-	urlPkg := ""
+	urlPkg, hostPkg := "", "" // net/url's and internal/host's names in the file, if it imports them
 	for _, imp := range file.Imports {
-		if imp.Path.Value == `"net/url"` {
+		switch imp.Path.Value {
+		case `"net/url"`:
 			urlPkg = "url"
 			if imp.Name != nil {
 				urlPkg = imp.Name.Name
+			}
+		case `"github.com/byward-dev/byward/internal/host"`:
+			hostPkg = "host"
+			if imp.Name != nil {
+				hostPkg = imp.Name.Name
 			}
 		}
 	}
@@ -373,7 +381,7 @@ func urlReadsOf(name string, src any) (urlReads, error) {
 			return nil, false
 		}
 		pkg, ok := sel.X.(*ast.Ident)
-		return sel, !ok || pkg.Name != urlPkg && !otherParsers[pkg.Name]
+		return sel, !ok || pkg.Name != urlPkg && !otherParsers[pkg.Name] && (hostPkg == "" || pkg.Name != hostPkg)
 	}
 	unfollowed := func(format string, args ...any) {
 		reads.unfollowed = append(reads.unfollowed, fmt.Sprintf(format, args...))

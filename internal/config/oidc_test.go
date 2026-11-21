@@ -233,7 +233,10 @@ func TestDevRecordsAnHTTPIdPIssuerOnLoopbackAsARelaxation(t *testing.T) {
 		{"127.0.0.1 over http", "http://127.0.0.1:8180/realms/byward", true, true},
 		{"127.0.0.1 over http, its scheme in capitals", "HTTP://127.0.0.1:8180/realms/byward", true, true}, // a URL's scheme is case-insensitive
 		{"[::1] over http", "http://[::1]:8180/realms/byward", true, true},
-		{"127.0.0.2 over http", "http://127.0.0.2:8180/realms/byward", true, true}, // any loopback address, as the adapter has it
+		{"127.0.0.2 over http", "http://127.0.0.2:8180/realms/byward", true, true},        // any loopback address, as the adapter has it
+		{"LOCALHOST over http (#482)", "http://LOCALHOST:8180/realms/byward", true, true}, // a host name in any case
+		{"127.1 over http, not in dotted decimal", "http://127.1:8180/realms/byward", true, false},
+		{"full-width localhost over http", "http://ｌｏｃａｌｈｏｓｔ:8180/realms/byward", true, false}, // localhost only in ASCII, as Parse writes it
 		{"https", "https://sso.example.com/realms/acme", true, false},
 		{"https on localhost", "https://localhost:8443/realms/byward", true, false},
 		{"http on a private address", "http://10.0.0.5:8180/realms/byward", true, false},
