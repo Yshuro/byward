@@ -121,8 +121,11 @@ func TestNoAuthInAContainerMayListenOnAllInterfacesWithAWarning(t *testing.T) {
 
 func TestNoAuthInAContainerHintUsesTheSchemesDefaultPort(t *testing.T) {
 	c, err := loadAnon(t, fakeHost("/.dockerenv", bridgeNetdev), "BYWARD_LISTEN=0.0.0.0:8443", "BYWARD_PUBLIC_URL=https://localhost/mcp")
-	if err != nil || !strings.Contains(strings.Join(c.Relaxations, "|"), "docker run -p 127.0.0.1:443:8443") {
-		t.Fatalf("err=%v relaxations=%v", err, c.Relaxations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(c.Relaxations, "|"), "docker run -p 127.0.0.1:443:8443") {
+		t.Fatalf("relaxations=%v", c.Relaxations)
 	}
 }
 
@@ -183,8 +186,11 @@ func TestNoAuthCannotBeCombinedWithAuthSettings(t *testing.T) {
 
 func TestNoAuthOffIsTheDefault(t *testing.T) {
 	c, err := load(t, nil)
-	if err != nil || c.NoAuth {
-		t.Fatalf("noauth=%v err=%v", c != nil && c.NoAuth, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.NoAuth {
+		t.Fatalf("noauth=%v, want false", c.NoAuth)
 	}
 }
 

@@ -68,8 +68,10 @@ func TestAScopeTokenIsThePrintableASCIIButSpaceQuoteAndBackslash(t *testing.T) {
 			c, err := load(t, nil, "BYWARD_SCOPE="+scope)
 			want := "BYWARD_SCOPE: want one scope token, such as mcp; got a value (3 characters, not shown): " + reason
 			switch {
-			case taken && (err != nil || c.Scope != scope):
+			case taken && err != nil:
 				t.Errorf("BYWARD_SCOPE=%q: %v, want it taken", scope, err)
+			case taken && c.Scope != scope:
+				t.Errorf("BYWARD_SCOPE=%q: got %q, want %q", scope, c.Scope, scope)
 			case !taken && (!isConfigError(err) || !strings.Contains(err.Error(), want)):
 				t.Errorf("BYWARD_SCOPE=%q: %v, want %q", scope, err, want)
 			}
@@ -79,8 +81,10 @@ func TestAScopeTokenIsThePrintableASCIIButSpaceQuoteAndBackslash(t *testing.T) {
 			c, err = loadOIDC(t, with("BYWARD_OIDC_SCOPES=openid,"+scope))
 			want = "BYWARD_OIDC_SCOPES: want a scope such as openid or email; got entry 2 of 2 (3 characters, not shown): " + reason
 			switch {
-			case taken && (err != nil || !slices.Contains(c.OIDCScopes, scope)):
+			case taken && err != nil:
 				t.Errorf("BYWARD_OIDC_SCOPES=openid,%q: %v, want it taken", scope, err)
+			case taken && !slices.Contains(c.OIDCScopes, scope):
+				t.Errorf("BYWARD_OIDC_SCOPES=openid,%q: got %v, want it to contain %q", scope, c.OIDCScopes, scope)
 			case !taken && (!isConfigError(err) || !strings.Contains(err.Error(), want)):
 				t.Errorf("BYWARD_OIDC_SCOPES=openid,%q: %v, want %q", scope, err, want)
 			}

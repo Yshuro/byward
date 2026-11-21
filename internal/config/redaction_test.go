@@ -200,8 +200,13 @@ func TestParseUpstreamURLTakesAnHTTPURLAndRequiresOne(t *testing.T) {
 		"http://[2001:db8::1]:9000/mcp": "[2001:db8::1]:9000",
 		"https://up.example/m%C3%A9":    "up.example",
 	} {
-		if u, err := ParseUpstreamURL(raw); err != nil || u.Host != host || u.String() != raw {
-			t.Errorf("ParseUpstreamURL(%q) = %v, %v; want it taken as given, with the host %s", raw, u, err, host)
+		u, err := ParseUpstreamURL(raw)
+		if err != nil {
+			t.Errorf("ParseUpstreamURL(%q) err = %v", raw, err)
+			continue
+		}
+		if u.Host != host || u.String() != raw {
+			t.Errorf("ParseUpstreamURL(%q) = %v; want it taken as given, with the host %s", raw, u, host)
 		}
 	}
 	if _, err := ParseUpstreamURL(""); err == nil || err.Error() != "BYWARD_UPSTREAM_URL is required" {

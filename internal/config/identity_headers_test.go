@@ -13,12 +13,20 @@ func TestPlainIdentityHeadersAreOffUntilSetTrue(t *testing.T) {
 	if c.IdentityHeaders {
 		t.Fatal("plain identity headers are on by default")
 	}
-	if c, err = load(t, nil, "BYWARD_IDENTITY_HEADERS=true"); err != nil || !c.IdentityHeaders {
-		t.Fatalf("BYWARD_IDENTITY_HEADERS=true: on %v, err %v", c != nil && c.IdentityHeaders, err)
+	c, err = load(t, nil, "BYWARD_IDENTITY_HEADERS=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.IdentityHeaders {
+		t.Fatal("BYWARD_IDENTITY_HEADERS=true: want on")
 	}
 	// A bare flag turns it on, as for every other boolean setting.
-	if c, err = load(t, []string{"--identity-headers"}); err != nil || !c.IdentityHeaders {
-		t.Fatalf("--identity-headers: on %v, err %v", c != nil && c.IdentityHeaders, err)
+	c, err = load(t, []string{"--identity-headers"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.IdentityHeaders {
+		t.Fatal("--identity-headers: want on")
 	}
 }
 

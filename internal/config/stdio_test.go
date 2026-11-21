@@ -173,8 +173,11 @@ func TestInvalidStdioSettingsAreRejectedNamingTheSetting(t *testing.T) {
 // The process caps take their bounds, 1 and 10000.
 func TestTheProcessCapsTakeTheirBounds(t *testing.T) {
 	c, _, err := Load([]string{"--", "/bin/x"}, stdioBase("BYWARD_STDIO_MAX_PROCESSES=10000", "BYWARD_STDIO_MAX_PROCESSES_PER_USER=1"), baseFiles)
-	if err != nil || c.StdioMaxProcesses != 10000 || c.StdioMaxPerUser != 1 {
-		t.Fatalf("got %v, %v; want the caps 10000 and 1", c, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.StdioMaxProcesses != 10000 || c.StdioMaxPerUser != 1 {
+		t.Fatalf("got %v; want the caps 10000 and 1", c)
 	}
 }
 

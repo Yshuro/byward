@@ -78,8 +78,11 @@ func TestGoogleDefaultsItsIssuer(t *testing.T) {
 	c, err := loadOIDC(t, func(env []string) []string {
 		return with("BYWARD_IDP=google")(without("BYWARD_IDP", "BYWARD_OIDC_ISSUER")(env))
 	})
-	if err != nil || c.OIDCIssuer != "https://accounts.google.com" {
-		t.Fatalf("google without an issuer: %v, %v", c, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.OIDCIssuer != "https://accounts.google.com" {
+		t.Fatalf("google without an issuer: %v", c)
 	}
 }
 
@@ -186,16 +189,22 @@ func TestTheRolesAndGroupsClaimSettingsAreRefusedWithEntra(t *testing.T) {
 // The default stays Entra, so existing deployments and the five-key quickstart are unchanged.
 func TestEntraIsTheDefaultIdP(t *testing.T) {
 	c, err := load(t, nil)
-	if err != nil || c.IdP != "entra" || c.OIDCIssuer != "" {
-		t.Fatalf("default IdP: %+v, %v", c, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.IdP != "entra" || c.OIDCIssuer != "" {
+		t.Fatalf("default IdP: %+v", c)
 	}
 }
 
 // A PEM key instead of a secret is read from its file, with its key ID.
 func TestAnOIDCClientKeyIsReadFromItsFile(t *testing.T) {
 	c, err := loadOIDC(t, withAKey("BYWARD_OIDC_CLIENT_KEY_ID=k1"))
-	if err != nil || !strings.Contains(c.OIDCClientKey, "BEGIN PRIVATE KEY") || c.OIDCClientKeyID != "k1" || c.OIDCClientSecret != "" {
-		t.Fatalf("config %+v, %v", c, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(c.OIDCClientKey, "BEGIN PRIVATE KEY") || c.OIDCClientKeyID != "k1" || c.OIDCClientSecret != "" {
+		t.Fatalf("config %+v", c)
 	}
 }
 

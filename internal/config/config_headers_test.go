@@ -55,8 +55,11 @@ func TestAHeaderThatOnlyResemblesAReservedOneIsAccepted(t *testing.T) {
 		for _, name := range []string{"mcp-params", "x-mcp-param-region", "x-tenant-param-id", "x-mcp-method"} {
 			t.Run(s.env+"="+name, func(t *testing.T) {
 				c, err := loadCred(t, nil, "k-123", append(s.extra, s.env+"="+name)...)
-				if want := textproto.CanonicalMIMEHeaderKey(name); err != nil || s.got(c) != want {
-					t.Fatalf("err = %v, want %s loaded as %s", err, name, want)
+				if err != nil {
+					t.Fatalf("err = %v", err)
+				}
+				if want := textproto.CanonicalMIMEHeaderKey(name); s.got(c) != want {
+					t.Fatalf("want %s loaded as %s", name, want)
 				}
 			})
 		}
