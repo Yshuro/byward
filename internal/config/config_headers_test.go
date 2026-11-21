@@ -7,7 +7,7 @@ import (
 )
 
 // headerSettings are the settings that name a header the proxy sets on upstream requests (they all
-// go through upstreamHeader), with what each needs to load and the header it loads into.
+// go through parseHeaderName), with what each needs to load and the header it loads into.
 var headerSettings = []struct {
 	env     string
 	extra   []string
@@ -24,15 +24,20 @@ var headerSettings = []struct {
 func TestAReservedHeaderIsRefusedInEitherSpellingByEverySettingThatSetsOne(t *testing.T) {
 	// One per family: the reserved names, MCP's own request headers (all of them: each would replace
 	// the client's at the upstream), then each reserved prefix, Mcp-Param-* (MCP 2026-07-28) included.
-	reserved := []string{"Host", "Mcp-Session-Id", "Mcp-Protocol-Version", "Mcp-Method", "Mcp-Name", "Last-Event-ID",
-		"X-Forwarded-For", "Proxy-Authorization", "Sec-Fetch-Mode", "Access-Control-Allow-Origin", "Mcp-Param-Region"}
+	// A reserved name is shown as the upstream reads it; a family only by its prefix, since what follows
+	// the prefix is the operator's text.
+	reserved := []struct{ h, shown string }{{"Host", "Host"}, {"Mcp-Session-Id", "Mcp-Session-Id"},
+		{"Mcp-Protocol-Version", "Mcp-Protocol-Version"}, {"Mcp-Method", "Mcp-Method"}, {"Mcp-Name", "Mcp-Name"},
+		{"Last-Event-ID", "Last-Event-Id"}, {"X-Forwarded-For", "a header starting X-Forwarded-"},
+		{"Proxy-Authorization", "a header starting Proxy-"}, {"Sec-Fetch-Mode", "a header starting Sec-"},
+		{"Access-Control-Allow-Origin", "a header starting Access-Control-"}, {"Mcp-Param-Region", "a header starting Mcp-Param-"}}
 	for _, s := range headerSettings {
-		for _, h := range reserved {
-			for _, name := range []string{h, strings.ReplaceAll(h, "-", "_")} {
+		for _, r := range reserved {
+			for _, name := range []string{r.h, strings.ReplaceAll(r.h, "-", "_")} {
 				t.Run(s.env+"="+name, func(t *testing.T) {
 					_, err := loadCred(t, nil, "k-123", append(s.extra, s.env+"="+name)...)
-					// The operator's own spelling, as config names it back.
-					want := s.env + ": " + textproto.CanonicalMIMEHeaderKey(name) + " is a header the proxy, the transport or MCP relies on"
+					want := s.env + ": want a header name such as Authorization or " + s.example + "; got " + r.shown +
+						": the proxy, the transport or MCP relies on it; use Authorization or a header of your own"
 					if err == nil || !strings.Contains(err.Error(), want) {
 						t.Fatalf("err = %v, want %q", err, want)
 					}
@@ -70,5 +75,37 @@ func TestAHeaderNameThatIsNotATokenIsRefusedByEverySettingThatSetsOne(t *testing
 				}
 			})
 		}
+	}
+}
+
+// Two header settings that name the same header are refused by their names alone: the header is
+// never shown, since an accepted name can be any token.
+func TestAHeaderClashNeverShowsTheHeader(t *testing.T) {
+	const header = "X-" + canaryText
+	obo := "BYWARD_OBO_SCOPES=https://graph.microsoft.com/User.Read"
+	cred := "BYWARD_UPSTREAM_CREDENTIAL_FILE=" + credFile
+	for _, tc := range []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{"the credential and the assertion", []string{cred, "BYWARD_UPSTREAM_CREDENTIAL_HEADER=" + header, "BYWARD_ASSERTION_HEADER=" + strings.ToLower(header)},
+			"BYWARD_UPSTREAM_CREDENTIAL_HEADER and BYWARD_ASSERTION_HEADER name the same header, but the credential and the identity assertion never share a header (ADR-0016 §7): set BYWARD_ASSERTION_HEADER to a header of your own, such as X-Byward-Identity, and verify the assertion there"},
+		{"the On-Behalf-Of token and the assertion", []string{obo, "BYWARD_OBO_HEADER=" + header, "BYWARD_ASSERTION_HEADER=" + strings.ToLower(header)},
+			"BYWARD_OBO_HEADER names the header that already carries the identity assertion (BYWARD_ASSERTION_HEADER); move the assertion to a header of its own, such as X-Byward-Identity, or use another header here, such as X-Byward-Downstream-Token"},
+		{"the On-Behalf-Of token and the credential", []string{obo, cred, "BYWARD_UPSTREAM_CREDENTIAL_HEADER=" + header, "BYWARD_OBO_HEADER=" + strings.ToLower(header)},
+			"BYWARD_OBO_HEADER names the header that already carries the operator's upstream credential (BYWARD_UPSTREAM_CREDENTIAL_HEADER); use a header of its own, such as X-Byward-Downstream-Token"},
+		// The example is left out where it is the very header that clashes.
+		{"the On-Behalf-Of token and the assertion, on the assertion's example", []string{obo, "BYWARD_OBO_HEADER=X-Byward-Identity", "BYWARD_ASSERTION_HEADER=X-Byward-Identity"},
+			"BYWARD_OBO_HEADER names the header that already carries the identity assertion (BYWARD_ASSERTION_HEADER); move the assertion to a header of its own, or use another header here, such as X-Byward-Downstream-Token"},
+		{"the credential and the assertion, on the assertion's example", []string{cred, "BYWARD_UPSTREAM_CREDENTIAL_HEADER=X-Byward-Identity", "BYWARD_ASSERTION_HEADER=X-Byward-Identity"},
+			"BYWARD_UPSTREAM_CREDENTIAL_HEADER and BYWARD_ASSERTION_HEADER name the same header, but the credential and the identity assertion never share a header (ADR-0016 §7): set BYWARD_ASSERTION_HEADER to a header of your own, and verify the assertion there"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := loadCred(t, nil, "k-123", tc.env...)
+			if !isConfigError(err) || !strings.Contains(err.Error(), tc.want) || holdsCanary(err.Error()) {
+				t.Fatalf("err = %v, want %q and the header never shown", err, tc.want)
+			}
+		})
 	}
 }

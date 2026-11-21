@@ -1,6 +1,9 @@
 package config
 
 import (
+	"errors"
+	"flag"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -177,12 +180,12 @@ func TestARefusedURLIsNeverShownButSaysWhy(t *testing.T) {
 	}
 }
 
-// A stray argument is quoted as a setting is: a value pasted after a space, as in
-// --upstream-url= https://user:pw@host, never shows its password.
+// A stray argument is never shown: a value pasted after a space, as in
+// --upstream-url= https://user:pw@host, is named by its length only.
 func TestAStrayArgumentNeverShowsACredentialItHolds(t *testing.T) {
 	_, err := load(t, []string{"--upstream-url=", "https://user:s3cretPW@up.example/mcp"})
-	if err == nil || strings.Contains(err.Error(), "s3cretPW") || !strings.Contains(err.Error(), `unexpected argument "https://up.example/mcp"`) {
-		t.Fatalf("Load = %v, want the stray argument refused and shown without its password", err)
+	if err == nil || strings.Contains(err.Error(), "s3cretPW") || strings.Contains(err.Error(), "up.example") || !strings.Contains(err.Error(), "got an unexpected argument (36 characters, not shown)") {
+		t.Fatalf("Load = %v, want the stray argument refused by its length, none of it shown", err)
 	}
 }
 
@@ -206,8 +209,8 @@ func TestParseUpstreamURLAcceptsAnHTTPURLAndRefusesAnyOtherByTheSettingsName(t *
 
 // #478: a URL whose scheme is mistyped in any of its seven ways, with a token in its path parameters,
 // is refused by each URL and host setting, the OIDC issuer, the trusted proxies, the OBO scopes and the
-// listen addresses, without any of it shown: neither the token nor the host. (BYWARD_OIDC_SCOPES takes
-// any text without white space, a backslash or a double quote: #512.)
+// listen addresses, without any of it shown: neither the token nor the host. (BYWARD_OIDC_SCOPES is left
+// out: a scope token may hold : / and ;, so most of these forms are scopes it accepts.)
 func TestAURLWithAMistypedSchemeIsRefusedWithoutAnyOfItShown(t *testing.T) {
 	forms := []string{"https;//h.example/;tok=", "https//h.example/;tok=", "https: //h.example/;tok=", `https:\h.example/;tok=`,
 		"//h.example/;tok=", "https:h.example/;tok=", "https:/h.example/;tok="}
@@ -226,6 +229,145 @@ func TestAURLWithAMistypedSchemeIsRefusedWithoutAnyOfItShown(t *testing.T) {
 				holdsCanary(err.Error()) || strings.Contains(err.Error(), "h.example") {
 				t.Errorf("%s=%s: %v, want it refused by its length, and neither its token nor its host shown", env, value, err)
 			}
+		}
+	}
+}
+
+// The flag package's own refusals quote the argument, the value given to a flag, or an undefined
+// flag's text; config refuses each without any text given (ADR-0031 §1), through Load, so with the
+// command line byward really parses.
+func TestAFlagTheFlagPackageRefusesNeverShowsTheTextGiven(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"a bad flag syntax", []string{"---upstream-url=https://h.example/x?k=" + canaryText}, "want flags as --name=value; got an argument with a bad flag syntax (48 characters, not shown)"},
+		{"a flag with no name", []string{"--=" + canaryText}, "want flags as --name=value; got an argument with a bad flag syntax (13 characters, not shown)"},
+		{"a value given to an action flag", []string{"--version=" + canaryText}, "--version: want true, false or no value; got a value it does not take (not shown)"},
+		// The value comes before the name in the flag package's error, so it cannot name another flag.
+		{"a value naming another flag", []string{"--version=x for -dev: y"}, "--version: want true, false or no value; got a value it does not take (not shown)"},
+		{"an undefined flag that is a value", []string{"--" + canaryText + "~tok=1"}, "want flags this command takes; got an undefined flag (14 characters, not shown)"},
+		{"an undefined flag in lower case", []string{"--" + strings.ToLower(canaryText)}, "want flags this command takes; got an undefined flag (10 characters, not shown)"},
+		{"an undefined flag near one of the command's own", []string{"--scop=1"}, "want flags this command takes; got an undefined flag (4 characters, not shown) (did you mean --scope?)"},
+		{"a flag that needs an argument", []string{"--scope"}, "flag needs an argument: -scope"},
+		{"a secret given inline as a flag", []string{"--entra-client-secret=" + canaryText}, "want flags this command takes; got an undefined flag (19 characters, not shown) (secrets come from a file: did you mean --entra-client-secret-file?)"},
+		{"a short undefined flag, near no flag enough to name", []string{"--v"}, "want flags this command takes; got an undefined flag (1 character, not shown)"},
+		{"an undefined flag three edits from --dev, too far to name", []string{"--debug"}, "want flags this command takes; got an undefined flag (5 characters, not shown)"},
+		{"an undefined flag one edit too far to name", []string{"--sco"}, "want flags this command takes; got an undefined flag (3 characters, not shown)"},
+		{"a flag two edits from --scope, too far for its length", []string{"--sxopx=1"}, "want flags this command takes; got an undefined flag (5 characters, not shown)"},
+		{"a long flag three edits from one of the command's own", []string{"--pubxxx-url=1"}, "want flags this command takes; got an undefined flag (10 characters, not shown) (did you mean --public-url?)"},
+		// Only a secret given inline is told secrets come from a file; another setting's file flag is a plain hint.
+		{"a path setting without its -file", []string{"--tls-cert=/x"}, "want flags this command takes; got an undefined flag (8 characters, not shown) (did you mean --tls-cert-file?)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := Load(tc.args, base, baseFiles)
+			if !isConfigError(err) || err.Error() != tc.want || holdsCanary(err.Error()) {
+				t.Fatalf("got %v, want the configuration error %q", err, tc.want)
+			}
+		})
+	}
+	// No flag byward has refuses a value but the action flags, which are booleans; a flag of another
+	// kind, refusing one, would be named with its own hint, and the value never shown.
+	tries := func(fs *flag.FlagSet) { fs.Func("tries", "", func(string) error { return errors.New("refused") }) }
+	want := "--tries: want a value it takes; got a value it does not take (not shown)"
+	if _, err := resolve(registry, []string{"--tries=" + canaryText}, base, baseFiles, tries); !isConfigError(err) || err.Error() != want {
+		t.Fatalf("got %v, want the configuration error %q", err, want)
+	}
+}
+
+// Every setting's refusal, tried with values that hold a canary in a context where the setting is
+// read, never shows the canary, in any case, and every line that refuses the setting is in the one
+// format "BYWARD_X: want …; got …" (ADR-0031 §1). Config's own counterpart of cmd/byward's
+// TestNoCommandShowsAHiddenOrARefusedValue, which runs the refused cells through every command. A
+// secret setting is read from a file, which that test writes; a line naming the setting otherwise
+// ("BYWARD_X is set without …") refuses its context, not a value.
+func TestNoRefusalShowsTheValueGiven(t *testing.T) {
+	forms := []string{"https://u:" + canaryText + "@h.example/x", canaryText, "X-Api-Key: " + canaryText, "a " + canaryText,
+		"+" + canaryText, canaryText + "=5", "authorize=" + canaryText, "1" + canaryText, "\"" + canaryText + "\""}
+	type ctx struct {
+		args  []string
+		env   []string
+		files readFileFunc
+	}
+	credFiles := func(p string) ([]byte, error) {
+		if p == credFile {
+			return []byte("k-123"), nil
+		}
+		return baseFiles(p)
+	}
+	withoutOIDCSecret := slices.DeleteFunc(slices.Clone(oidcBase), func(kv string) bool { return strings.HasPrefix(kv, "BYWARD_OIDC_CLIENT_SECRET_FILE=") })
+	// A context where each setting is read: by its group, and for these by the settings it needs beside it.
+	special := map[string]ctx{
+		"upstream-command":           {nil, stdioBase(), baseFiles}, // given as itself, not after --
+		"tls-cert-file":              {nil, append(slices.Clone(base), "BYWARD_TLS_KEY_FILE=/run/tls/tls.key"), baseFiles},
+		"tls-key-file":               {nil, append(slices.Clone(base), "BYWARD_TLS_CERT_FILE=/run/tls/tls.crt"), baseFiles},
+		"entra-federated-token-file": {nil, withoutSecret(), baseFiles},
+		"upstream-credential-header": {nil, append(slices.Clone(base), "BYWARD_UPSTREAM_CREDENTIAL_FILE="+credFile), credFiles},
+		"oidc-client-key-alg":        {nil, append(slices.Clone(withoutOIDCSecret), "BYWARD_OIDC_CLIENT_KEY_FILE=/run/secrets/key.pem"), oidcFiles},
+		"oidc-client-key-id":         {nil, append(slices.Clone(withoutOIDCSecret), "BYWARD_OIDC_CLIENT_KEY_FILE=/run/secrets/key.pem"), oidcFiles},
+	}
+	contextOf := func(s Setting) ctx {
+		if c, ok := special[s.Name]; ok {
+			return ctx{c.args, slices.Clone(c.env), c.files}
+		}
+		switch s.Group {
+		case GroupStdioUpstream:
+			return ctx{[]string{"--", "/bin/x"}, stdioBase(), baseFiles}
+		case GroupOIDC:
+			return ctx{nil, slices.Clone(oidcBase), oidcFiles}
+		case GroupAppOnly:
+			return ctx{nil, append(slices.Clone(base), "BYWARD_APP_TOKENS=entra", "BYWARD_APP_ROLES=r"), baseFiles}
+		}
+		return ctx{nil, slices.Clone(base), baseFiles}
+	}
+	// The settings config refuses none of these forms for: free text, client IDs, claim and role names,
+	// and the gate and app lists. Every other setting must refuse one in the one format, so the test cannot
+	// pass by no longer reaching its parser.
+	acceptsEveryForm := []string{"app-client-ids", "app-roles", "entra-client-id", "gate-email-domains", "gate-groups",
+		"gate-hosted-domains", "gate-roles", "gate-tenants", "oidc-client-id", "oidc-client-key-id", "oidc-groups-claim",
+		"oidc-name", "oidc-roles-claim", "oidc-subject-claim", "operator-name", "resource-name", "scope-description"}
+	for _, s := range registry {
+		if s.Secret() {
+			continue
+		}
+		inFormat := 0
+		for _, form := range forms {
+			c := contextOf(s)
+			_, _, err := Load(c.args, append(c.env, s.Env()+"="+form), c.files)
+			if err == nil {
+				continue
+			}
+			if holdsCanary(err.Error()) {
+				t.Errorf("%s=%q: %v, shows the value", s.Env(), form, err)
+			}
+			for _, line := range strings.Split(err.Error(), "\n") {
+				switch {
+				case !strings.HasPrefix(line, s.Env()+": "):
+				case !strings.HasPrefix(line, s.Env()+": want ") || !strings.Contains(line, "; got "):
+					t.Errorf("%s=%q: the line %q is outside the one format", s.Env(), form, line)
+				default:
+					inFormat++
+				}
+			}
+		}
+		switch accepts := slices.Contains(acceptsEveryForm, s.Name); {
+		case inFormat == 0 && !accepts:
+			t.Errorf("%s refused none of the forms in the one format: its parser was not reached; give it a context, or list it in acceptsEveryForm", s.Env())
+		case inFormat > 0 && accepts:
+			t.Errorf("%s refused a form in the one format, but acceptsEveryForm lists it: remove it", s.Env())
+		}
+	}
+}
+
+// A message of the flag package flagError does not know, as a later Go could write, or an invalid value
+// for a flag the set does not define, is refused without its text: the fallback fails closed.
+func TestAFlagPackageMessageFlagErrorDoesNotKnowShowsNoText(t *testing.T) {
+	const want = "the command line is refused (the flag package's message is not shown)"
+	fs := flag.NewFlagSet("byward", flag.ContinueOnError)
+	for _, msg := range []string{`invalid value "` + canaryText + `" for flag -nosuch: x`, "a new message quoting " + canaryText} {
+		if err := flagError(fs, errors.New(msg), nil); !isConfigError(err) || err.Error() != want {
+			t.Errorf("flagError(%q) = %v, want %q", msg, err, want)
 		}
 	}
 }

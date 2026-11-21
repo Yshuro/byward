@@ -84,7 +84,7 @@ func TestOnlyKnownCodeReadsDevelopmentMode(t *testing.T) {
 			if sel, ok := n.(*ast.SelectorExpr); ok && sel.Sel.Name == "OIDCLoopbackHTTP" {
 				decided[rel]++
 			}
-			// The setting by name reaches --dev without the field (Values.Effective, v.get).
+			// The setting by name reaches --dev without the field (Values.Effective, v.boolean).
 			if lit, ok := n.(*ast.BasicLit); ok && lit.Kind == token.STRING {
 				if name, err := strconv.Unquote(lit.Value); err == nil && (name == "dev" || name == "BYWARD_DEV") {
 					named[rel]++
@@ -98,8 +98,7 @@ func TestOnlyKnownCodeReadsDevelopmentMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Only config names the setting: the registry entry, and reading it (Values.boolean).
-	// registry.go names it in readAsText, the settings get may read, until #512 (no reader there).
-	checkCounts(t, "names the dev setting", named, map[string]int{"internal/config/settings.go": 1, "internal/config/config.go": 1, "internal/config/registry.go": 1})
+	checkCounts(t, "names the dev setting", named, map[string]int{"internal/config/settings.go": 1, "internal/config/config.go": 1})
 	checkCounts(t, "selects OIDCLoopbackHTTP, --dev under another name,", decided, decidedReaders)
 	devCounts := map[string]int{}
 	for rel, r := range devReaders {

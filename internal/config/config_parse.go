@@ -1,29 +1,16 @@
 package config
 
 import (
+	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/byward-dev/byward/internal/ratelimit"
 )
-
-// checkText limits page wording: no control or format characters (bidi overrides), at most max
-// characters.
-func checkText(name, s string, max int) []error {
-	env := Setting{Name: name}.Env()
-	if strings.ContainsFunc(s, func(r rune) bool { return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) }) {
-		return []error{errorf("%s: must not contain control or formatting characters", env)}
-	}
-	if n := utf8.RuneCountInString(s); n > max {
-		return []error{errorf("%s: at most %d characters, got %d", env, max, n)}
-	}
-	return nil
-}
 
 // checkInlineSecrets rejects secrets given directly in env; development mode accepts them and
 // reports the relaxation instead.
@@ -174,19 +161,34 @@ const (
 	maxRateLimit = 10000
 )
 
-func parseRateLimits(raw string) (map[string]int, error) {
+func parseRateLimits(val Value) (map[string]int, []error) {
+	s := val.Setting
+	want := fmt.Sprintf("endpoint=per-minute entries, the endpoint %s and the limit a whole number from %d to %d", oneOf(ratelimit.Endpoints), minRateLimit, maxRateLimit)
 	out := ratelimit.Defaults()
-	for _, item := range splitList(raw) {
-		name, val, ok := strings.Cut(item, "=")
+	var errs []error
+	list, at, err := parseEntries(val)
+	if err != nil {
+		return nil, []error{err}
+	}
+	for i, item := range list {
+		name, per, ok := strings.Cut(item, "=")
 		name = strings.TrimSpace(name)
-		if _, known := out[name]; !ok || !known {
-			return nil, errorf("BYWARD_OAUTH_RATE_LIMITS: %q is not endpoint=per-minute for one of %s", item, strings.Join(ratelimit.Endpoints, ", "))
+		n, err := strconv.Atoi(strings.TrimSpace(per))
+		switch _, known := out[name]; {
+		case !ok || !known:
+			errs = append(errs, refusedForm(s, at(i), item, want, "it is not endpoint=per-minute for one of the endpoints"))
+		case errors.Is(err, strconv.ErrRange):
+			errs = append(errs, refusedForm(s, at(i), item, want, "its limit is out of range"))
+		case err != nil:
+			errs = append(errs, refusedForm(s, at(i), item, want, "its limit is not a whole number"))
+		case n < minRateLimit || n > maxRateLimit:
+			errs = append(errs, refusedMeaning(s, at(i), name+"="+strconv.Itoa(n), want, "the limit is out of range"))
+		default:
+			out[name] = n
 		}
-		n, err := strconv.Atoi(strings.TrimSpace(val))
-		if err != nil || n < minRateLimit || n > maxRateLimit {
-			return nil, errorf("BYWARD_OAUTH_RATE_LIMITS: %s must be a whole number from %d to %d per minute, got %q", name, minRateLimit, maxRateLimit, val)
-		}
-		out[name] = n
+	}
+	if len(errs) > 0 {
+		return nil, errs
 	}
 	return out, nil
 }
@@ -194,10 +196,13 @@ func parseRateLimits(raw string) (map[string]int, error) {
 // parseProxies reads BYWARD_TRUSTED_PROXIES. An entry that is not a CIDR or an IP address is
 // never shown (ADR-0031 §1); one refused for what it names is shown as netip read it, without a zone.
 func parseProxies(val Value) ([]netip.Prefix, error) {
-	s, raw := val.Setting, val.Given.raw()
+	s := val.Setting
 	const want = "a CIDR or an IP address such as 10.0.0.0/8 or 192.0.2.1"
 	var out []netip.Prefix
-	list, at := entries(raw)
+	list, at, err := parseEntries(val)
+	if err != nil {
+		return nil, err
+	}
 	for i, item := range list {
 		zoned := false
 		p, err := netip.ParsePrefix(item)
@@ -232,25 +237,18 @@ func parseProxies(val Value) ([]netip.Prefix, error) {
 // entry (::/0, fe80::/9) is accepted: it cannot trust a link-local peer either.
 var linkLocal = netip.MustParsePrefix("fe80::/10")
 
-func splitList(s string) []string {
-	var out []string
-	for _, p := range strings.Split(s, ",") {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
 // parseOrigins reads BYWARD_ALLOWED_ORIGINS: each origin as browsers send it (browserOrigin),
 // with its host[:port] checked as BYWARD_ALLOWED_HOSTS checks one (hostPort), and refused when no
 // browser could send it (browserIPv4). A refused entry is never shown (ADR-0031 §1).
 func parseOrigins(val Value) ([]string, []error) {
-	s, raw := val.Setting, val.Given.raw()
+	s := val.Setting
 	const want = "an origin (scheme://host[:port]) such as https://app.example"
 	var out []string
 	var errs []error
-	list, at := entries(raw)
+	list, at, err := parseEntries(val)
+	if err != nil {
+		return nil, []error{err}
+	}
 	for i, o := range list {
 		u, reason := parseOrigin(o)
 		if reason != "" {
@@ -350,10 +348,13 @@ func hostPort(h string) (stored, reason string) {
 // parseAllowedHosts reads BYWARD_ALLOWED_HOSTS (#323, #325): each entry as hostPort stores it.
 // A refused entry is never shown (ADR-0031 §1).
 func parseAllowedHosts(val Value) ([]string, []error) {
-	s, raw := val.Setting, val.Given.raw()
+	s := val.Setting
 	var out []string
 	var errs []error
-	list, at := entries(raw)
+	list, at, err := parseEntries(val)
+	if err != nil {
+		return nil, []error{err}
+	}
 	for i, h := range list {
 		n, reason := hostPort(h)
 		if reason != "" {

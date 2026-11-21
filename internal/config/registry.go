@@ -122,36 +122,6 @@ type Values struct {
 	command []string
 }
 
-// get returns the text of a setting in readAsText, one not yet read through its parser of its own. It
-// panics on any other, which every test that loads the setting catches, however the name reaches it.
-func (v *Values) get(name string) string {
-	if !readAsText[name] {
-		panic("config: " + name + " is read through its parser, not get")
-	}
-	return v.byKey[name].Given.raw()
-}
-
-// readAsText are the settings still read as text through get (ADR-0031 §1). The list only shrinks:
-// #512 gives the rest parsers of their own and deletes it, with get.
-var readAsText = map[string]bool{
-	"upstream-header-timeout": true, "upstream-credential-header": true,
-	"upstream-strip-headers": true, "upstream-command": true, "upstream-env": true, "stdio-max-processes": true,
-	"stdio-max-processes-per-user": true, "stdio-stream-idle-timeout": true, "tls-cert-file": true,
-	"tls-key-file": true, "scope": true, "resource-name": true, "log-format": true, "oauth-rate-limits": true,
-	"idp": true, "entra-tenant": true, "entra-client-id": true, "entra-client-secret": true,
-	"entra-client-certificate": true, "entra-federated-token-file": true,
-	"entra-client-secret-expires-at": true, "oidc-client-id": true, "oidc-client-secret": true,
-	"oidc-client-key": true, "oidc-client-key-alg": true, "oidc-client-key-id": true,
-	"oidc-subject-claim": true, "oidc-roles-claim": true, "oidc-groups-claim": true, "oidc-name": true,
-	"data-dir": true, "keys-dir": true, "assertion-keys-dir": true, "assertion-header": true,
-	"identity-headers": true, "obo-header": true, "assertion-claims": true, "assertion-unverified-email": true,
-	"static-clients-file": true, "gate-tenants": true, "gate-roles": true, "gate-groups": true,
-	"gate-email-domains": true, "gate-hosted-domains": true, "dcr": true, "cimd": true, "app-tokens": true,
-	"app-roles": true, "app-client-ids": true, "gate-allow-empty": true, "operator-name": true,
-	"scope-description": true, "store-dir": true, "store-postgres-dsn": true, "store-counter-file": true,
-	"refresh-grace": true, "insecure-no-auth": true, "dev": true,
-}
-
 // value is the named setting's Value, for its parser. It panics on a name these Values do not hold,
 // which every test that loads the setting catches, so a parser never gets a Value without a shape.
 func (v *Values) value(name string) Value {
@@ -201,13 +171,7 @@ func (v *Values) emptySecretFile(name string) error {
 
 // boolean reads a true/false setting. Every setting read this way must be Bool in the registry, so a
 // bare --name means true (TestBooleanSettingsAreExactlyTheBoolFlags, TestEveryBooleanReadIsOfABoolFlag).
-func (v *Values) boolean(name string) (bool, error) {
-	b, err := strconv.ParseBool(v.get(name))
-	if err != nil {
-		return false, errorf("%s: want true or false, got %q", Setting{Name: name}.Env(), v.get(name))
-	}
-	return b, nil
-}
+func (v *Values) boolean(name string) (bool, error) { return parseBool(v.value(name)) }
 
 // Effective lists every setting with its source, in registry order.
 func (v *Values) Effective() []Value {
@@ -257,10 +221,14 @@ func resolve(reg []Setting, args, environ []string, readFile readFileFunc, extra
 		if errors.Is(err, flag.ErrHelp) {
 			return nil, err
 		}
-		return nil, errorf("%v", err)
+		secrets := map[string]bool{}
+		for _, s := range reg {
+			secrets[s.Name] = s.Secret()
+		}
+		return nil, flagError(fs, err, secrets)
 	}
 	if fs.NArg() > 0 {
-		return nil, errorf("unexpected argument %s", logging.Quote(fs.Arg(0)))
+		return nil, errorf("want settings as --name=value flags, and the stdio upstream command after --; got an unexpected argument %s", notShown(fs.Arg(0)))
 	}
 	set := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
@@ -318,6 +286,71 @@ func resolve(reg []Setting, args, environ []string, readFile readFileFunc, extra
 		vals.command = command
 	}
 	return vals, nil
+}
+
+// flagError is err, the flag package's refusal of args, without any text of the operator's
+// (ADR-0031 §1): "bad flag syntax" quotes the whole argument, an invalid value the value given to a
+// flag, and an undefined flag all its text before =, which can be a value pasted as an argument. A
+// flag that needs an argument is named, as it is one of the command's own. Any other message the flag
+// package may write is refused without its text, so a new one cannot show a value.
+func flagError(fs *flag.FlagSet, err error, secrets map[string]bool) error {
+	msg := err.Error()
+	if rest, ok := strings.CutPrefix(msg, "bad flag syntax: "); ok {
+		return errorf("want flags as --name=value; got an argument with a bad flag syntax %s", notShown(rest))
+	}
+	if f := refusedFlag(fs, msg); f != nil {
+		want := "a value it takes"
+		if b, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && b.IsBoolFlag() {
+			want = "true, false or no value"
+		}
+		return errorf("--%s: want %s; got a value it does not take (not shown)", f.Name, want)
+	}
+	if name, ok := strings.CutPrefix(msg, "flag provided but not defined: -"); ok {
+		return errorf("want flags this command takes; got an undefined flag %s%s", notShown(name), flagHint(fs, name, secrets))
+	}
+	if strings.HasPrefix(msg, "flag needs an argument: -") {
+		return errorf("%v", err)
+	}
+	return errorf("the command line is refused (the flag package's message is not shown)")
+}
+
+// flagHint suggests the command's own flag an undefined one most likely meant, never the text given:
+// the name's -file flag, with the reason when the name is a secret's (secrets), else the nearest name,
+// only when it is near enough that the operator, who is not shown the name, can trust it.
+func flagHint(fs *flag.FlagSet, name string, secrets map[string]bool) string {
+	switch {
+	case fs.Lookup(name+"-file") != nil && secrets[name]:
+		return " (secrets come from a file: did you mean --" + name + "-file?)"
+	case fs.Lookup(name+"-file") != nil:
+		return " (did you mean --" + name + "-file?)"
+	}
+	known := map[string]bool{}
+	fs.VisitAll(func(f *flag.Flag) { known[f.Name] = true })
+	if s := suggest(name, known); s != "" && distance(name, s) <= len(name)/3 {
+		return " (did you mean --" + s + "?)"
+	}
+	return ""
+}
+
+// refusedFlag is the flag msg, the flag package's "invalid boolean value" or "invalid value" error,
+// names, or nil. The value comes first, quoted, so the name is read after it: a value holding
+// " for -name" cannot name another flag.
+func refusedFlag(fs *flag.FlagSet, msg string) *flag.Flag {
+	for _, prefix := range []string{"invalid boolean value ", "invalid value "} {
+		rest, ok := strings.CutPrefix(msg, prefix)
+		if !ok {
+			continue
+		}
+		quoted, err := strconv.QuotedPrefix(rest)
+		if err != nil {
+			return nil
+		}
+		rest = strings.TrimPrefix(strings.TrimPrefix(rest[len(quoted):], " for flag -"), " for -")
+		if name, _, ok := strings.Cut(rest, ": "); ok {
+			return fs.Lookup(name)
+		}
+	}
+	return nil
 }
 
 // inlineSecrets lists secret settings given directly in env instead of through a file.

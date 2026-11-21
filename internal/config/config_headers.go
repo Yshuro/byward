@@ -3,9 +3,7 @@ package config
 import (
 	"net/textproto"
 	"strings"
-	"unicode"
 
-	"github.com/byward-dev/byward/internal/logging"
 	"golang.org/x/net/http/httpguts"
 )
 
@@ -35,35 +33,52 @@ func withMCPHeaders(m map[string]bool) map[string]bool {
 	return m
 }
 
-// quoteHeaderName is v, a refused header-name value, as an error may quote it: only the text before
-// the first ':' or white space, the would-be name, since the rest of a pasted header line is its
-// value, which can be a token (#466). That name is quoted as logging.Quote does; where Quote hides
-// it, or nothing comes before the separator, the whole value is logging.Hidden.
-func quoteHeaderName(v string) string {
-	i := strings.IndexFunc(v, func(r rune) bool { return r == ':' || unicode.IsSpace(r) })
-	if i < 0 {
-		return logging.Quote(v)
+// headerExamples is each header setting's example of a header of the operator's own, which its
+// refusals suggest.
+var headerExamples = map[string]string{ //nolint:gosec // G101: header names an operator may use, not a credential
+	"assertion-header": "X-Byward-Identity", "upstream-credential-header": "X-Api-Key",
+	"obo-header": "X-Byward-Downstream-Token"}
+
+// headerNameWant is what the header setting name wants, in every refusal of it. It panics on a setting
+// without an example, which every test that loads the setting catches.
+func headerNameWant(name string) string {
+	example, ok := headerExamples[name]
+	if !ok {
+		panic("config: no header example for " + name)
 	}
-	if q := logging.Quote(v[:i]); i > 0 && q != logging.Hidden {
-		return q + " (the rest is not shown)"
-	}
-	return logging.Hidden
+	return "a header name such as Authorization or " + example
 }
 
-// upstreamHeader reads a setting naming a header the proxy sets on upstream requests: a valid
-// token, and not one the proxy, the transport or MCP relies on. example is a header of the
-// operator's own to suggest.
-func upstreamHeader(v *Values, setting, example string) (string, error) {
-	env := Setting{Name: setting}.Env()
-	h := textproto.CanonicalMIMEHeaderKey(strings.TrimSpace(v.get(setting)))
-	n := CanonicalHeader(h) // as the upstream may read it: X_Forwarded_For is X-Forwarded-For
-	switch {
-	case !httpguts.ValidHeaderFieldName(h):
-		return "", errorf("%s: want a header name such as Authorization or %s, got %s", env, example, quoteHeaderName(v.get(setting)))
-	case reservedHeaders[n] || strings.HasPrefix(n, "X-Forwarded-") || strings.HasPrefix(n, "Proxy-") || strings.HasPrefix(n, "Sec-") || strings.HasPrefix(n, "Access-Control-") || strings.HasPrefix(n, MCPParamPrefix):
-		return "", errorf("%s: %s is a header the proxy, the transport or MCP relies on; use Authorization or a header of your own such as %s", env, h, example)
+// parseHeaderName reads a setting naming a header the proxy sets on upstream requests: a valid token,
+// and not one the proxy, the transport or MCP relies on; its refusals suggest the setting's example
+// (headerExamples). A refused name is never shown: a value pasted as Name: value holds a token after
+// the name (#466).
+func parseHeaderName(val Value) (string, error) {
+	raw := val.Given.raw()
+	want := headerNameWant(val.Setting.Name)
+	h := textproto.CanonicalMIMEHeaderKey(strings.TrimSpace(raw))
+	if !httpguts.ValidHeaderFieldName(h) {
+		return "", refusedForm(val.Setting, whole, raw, want, "it is not a header name")
+	}
+	if shown := relied(CanonicalHeader(h)); shown != "" { // as the upstream may read it: X_Forwarded_For is X-Forwarded-For
+		return "", refusedMeaning(val.Setting, whole, shown, want, "the proxy, the transport or MCP relies on it; use Authorization or a header of your own")
 	}
 	return h, nil
+}
+
+// relied is how a refusal names n, a canonical header the proxy, the transport or MCP relies on: by
+// name when it is one of reservedHeaders, by its family otherwise, since what follows a prefix is the
+// operator's text; "" when nothing relies on it.
+func relied(n string) string {
+	if reservedHeaders[n] {
+		return n
+	}
+	for _, p := range []string{"X-Forwarded-", "Proxy-", "Sec-", "Access-Control-", MCPParamPrefix} {
+		if strings.HasPrefix(n, p) {
+			return "a header starting " + p
+		}
+	}
+	return ""
 }
 
 // The plain identity headers (ADR-0016 §5). Their names are fixed, and reserved even while
@@ -84,6 +99,15 @@ const (
 // IdentityHeaderNames are the plain identity headers.
 var IdentityHeaderNames = []string{HeaderSubject, HeaderClientID, HeaderPrincipalType, HeaderRoles, HeaderGroups, HeaderEmail, HeaderEmailVerified, HeaderName}
 
+// suchAs is ", such as <example>", the header setting name's example, for a clash's advice, or nothing
+// when the example is the very header that clashes (clashing), which the advice would point back at.
+func suchAs(name, clashing string) string {
+	if example := headerExamples[name]; !sameHeader(example, clashing) {
+		return ", such as " + example
+	}
+	return ""
+}
+
 // headerClashes refuses two purposes in one header: the identity assertion, the operator's
 // upstream credential, the On-Behalf-Of token and the plain identity headers each have their own
 // (ADR-0016 §4, §5, §7; ADR-0017 §3). Names are compared by CanonicalHeader, so X_Api_Key and
@@ -92,13 +116,16 @@ func (c *Config) headerClashes() []error {
 	var errs []error
 	aEnv, cEnv := Setting{Name: "assertion-header"}.Env(), Setting{Name: "upstream-credential-header"}.Env()
 	if c.UpstreamCredentialHeader != "" && sameHeader(c.UpstreamCredentialHeader, c.AssertionHeader) {
-		errs = append(errs, errorf("%s and %s are both %s, but the credential and the identity assertion never share a header (ADR-0016 §7): set %s to a header of your own, such as X-Byward-Identity, and verify the assertion there",
-			cEnv, aEnv, c.UpstreamCredentialHeader, aEnv))
+		// The header is not shown: an accepted name can be any token.
+		errs = append(errs, errorf("%s and %s name the same header, but the credential and the identity assertion never share a header (ADR-0016 §7): set %s to a header of your own%s, and verify the assertion there",
+			cEnv, aEnv, aEnv, suchAs("assertion-header", c.AssertionHeader)))
 	}
-	for _, u := range []struct{ env, header string }{{aEnv, c.AssertionHeader}, {cEnv, c.UpstreamCredentialHeader}, {Setting{Name: "obo-header"}.Env(), c.OBOHeader}} {
+	for _, u := range []struct{ name, header string }{{"assertion-header", c.AssertionHeader},
+		{"upstream-credential-header", c.UpstreamCredentialHeader}, {"obo-header", c.OBOHeader}} {
 		for _, plain := range IdentityHeaderNames {
-			if sameHeader(u.header, plain) {
-				errs = append(errs, errorf("%s: %s is one of the plain identity headers the proxy sets (docs/how-to/plain-identity-headers.md); use another header", u.env, u.header))
+			if sameHeader(u.header, plain) { // shown by the fixed name it matches, never as given
+				errs = append(errs, refusedMeaning(lookup(u.name), whole, plain, headerNameWant(u.name),
+					"it is one of the plain identity headers the proxy sets (docs/how-to/plain-identity-headers.md); use another header"))
 			}
 		}
 	}

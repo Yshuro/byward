@@ -9,6 +9,7 @@ import (
 	"os"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -88,27 +89,33 @@ func TestUnknownEnvFarFromAnySettingHasNoSuggestion(t *testing.T) {
 	}
 }
 
+// scopeRefused is BYWARD_SCOPE's refusal of a value of n characters for a character no scope token holds.
+func scopeRefused(n int) string {
+	return "BYWARD_SCOPE: want one scope token, such as mcp; got a value (" + strconv.Itoa(n) + " characters, not shown): " + scopeCharsRefused
+}
+
+// scopeCharsRefused is the reason, written out: the test pins the literal, never the code's constant.
+const scopeCharsRefused = "it has a character a scope token cannot hold: white space, a double quote, a backslash or one that is not printable ASCII"
+
 func TestInvalidSettingsAreRejectedNamingTheSetting(t *testing.T) {
 	cases := []struct {
 		name, env, want string
 	}{
 		{"required", "BYWARD_PUBLIC_URL=", "BYWARD_PUBLIC_URL is required"},
 		{"http loopback without dev", "BYWARD_PUBLIC_URL=http://127.0.0.1:8080/mcp", "needs --dev"},
-		{"log format", "BYWARD_LOG_FORMAT=xml", "BYWARD_LOG_FORMAT"},
-		{"two scopes", "BYWARD_SCOPE=a b", "BYWARD_SCOPE"},
-		{"cimd trusted hosts blank", "BYWARD_CIMD_TRUSTED_HOSTS= ,", "BYWARD_CIMD_TRUSTED_HOSTS is set but lists nothing"},
-		{"cimd allowed hosts blank", "BYWARD_CIMD_ALLOWED_HOSTS=,", "BYWARD_CIMD_ALLOWED_HOSTS is set but lists nothing"},
-		{"client denylist blank", "BYWARD_CLIENT_DENYLIST= ,", "BYWARD_CLIENT_DENYLIST is set but lists nothing"},
-		{"gate tenants blank", "BYWARD_GATE_TENANTS=,", "BYWARD_GATE_TENANTS is set but lists nothing"},
-		{"gate roles blank", "BYWARD_GATE_ROLES= ,,", "BYWARD_GATE_ROLES is set but lists nothing"},
-		{"gate groups blank", "BYWARD_GATE_GROUPS= ", "BYWARD_GATE_GROUPS is set but lists nothing"},
-		{"gate email domains blank", "BYWARD_GATE_EMAIL_DOMAINS=,", "BYWARD_GATE_EMAIL_DOMAINS is set but lists nothing"},
-		{"gate hosted domains blank", "BYWARD_GATE_HOSTED_DOMAINS=,", "BYWARD_GATE_HOSTED_DOMAINS is set but lists nothing"},
-		{"operator name too long", "BYWARD_OPERATOR_NAME=" + strings.Repeat("é", 81), "BYWARD_OPERATOR_NAME: at most 80 characters, got 81"},
-		{"operator name with a newline", "BYWARD_OPERATOR_NAME=a\nb", "BYWARD_OPERATOR_NAME: must not contain control or formatting characters"},
-		{"operator name with a bidi override", "BYWARD_OPERATOR_NAME=Evil \u202eTI", "BYWARD_OPERATOR_NAME: must not contain control or formatting characters"},
-		{"scope description with a bidi override", "BYWARD_SCOPE_DESCRIPTION=Read \u202edashboards", "BYWARD_SCOPE_DESCRIPTION: must not contain control or formatting characters"},
-		{"scope description too long", "BYWARD_SCOPE_DESCRIPTION=" + strings.Repeat("x", 201), "BYWARD_SCOPE_DESCRIPTION: at most 200 characters"},
+		{"log format", "BYWARD_LOG_FORMAT=xml", "BYWARD_LOG_FORMAT: want json or text; got a value (3 characters, not shown): it is not one of them"},
+		{"two scopes", "BYWARD_SCOPE=a b", scopeRefused(3)},
+		{"a scope with a tab", "BYWARD_SCOPE=mcp\tx", scopeRefused(5)},
+		{"a scope that is not ASCII", "BYWARD_SCOPE=mcpü", scopeRefused(4)},
+		{"a scope with DEL", "BYWARD_SCOPE=mcp\x7f", scopeRefused(4)},
+		{"no scope", "BYWARD_SCOPE=", "BYWARD_SCOPE: want one scope token, such as mcp; got nothing"},
+		{"a scope with a quote", `BYWARD_SCOPE=a"b`, scopeRefused(3)},
+		{"a scope with a backslash", `BYWARD_SCOPE=a\b`, scopeRefused(3)},
+		{"operator name too long", "BYWARD_OPERATOR_NAME=" + strings.Repeat("é", 81), "BYWARD_OPERATOR_NAME: want text of at most 80 characters, without control or formatting characters; got a value (81 characters, not shown): it is too long"},
+		{"operator name with a newline", "BYWARD_OPERATOR_NAME=a\nb", "BYWARD_OPERATOR_NAME: want text of at most 80 characters, without control or formatting characters; got a value (3 characters, not shown): it has a control or formatting character"},
+		{"operator name with a bidi override", "BYWARD_OPERATOR_NAME=Evil \u202eTI", "BYWARD_OPERATOR_NAME: want text of at most 80 characters, without control or formatting characters; got a value (8 characters, not shown): it has a control or formatting character"},
+		{"scope description with a bidi override", "BYWARD_SCOPE_DESCRIPTION=Read \u202edashboards", "BYWARD_SCOPE_DESCRIPTION: want text of at most 200 characters, without control or formatting characters; got a value (16 characters, not shown): it has a control or formatting character"},
+		{"scope description too long", "BYWARD_SCOPE_DESCRIPTION=" + strings.Repeat("x", 201), "BYWARD_SCOPE_DESCRIPTION: want text of at most 200 characters, without control or formatting characters; got a value (201 characters, not shown): it is too long"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -454,8 +461,9 @@ func TestHelpFlagAsksForUsageListingEnvNames(t *testing.T) {
 }
 
 func TestPositionalArgumentIsAConfigError(t *testing.T) {
-	if _, _, err := Load([]string{"extra"}, base, baseFiles); !isConfigError(err) || !strings.Contains(err.Error(), "extra") {
-		t.Fatalf("want config error naming the argument, got %v", err)
+	const want = "want settings as --name=value flags, and the stdio upstream command after --; got an unexpected argument (5 characters, not shown)"
+	if _, _, err := Load([]string{"extra"}, base, baseFiles); !isConfigError(err) || err.Error() != want {
+		t.Fatalf("got %v, want the config error %q", err, want)
 	}
 }
 
@@ -569,7 +577,7 @@ func TestBrokerSettingsAreRequired(t *testing.T) {
 	if _, err := load(t, nil, "BYWARD_ENTRA_CLIENT_SECRET_FILE="); !isConfigError(err) || !strings.Contains(err.Error(), "BYWARD_ENTRA_CLIENT_SECRET_FILE, BYWARD_ENTRA_CLIENT_CERTIFICATE_FILE or BYWARD_ENTRA_FEDERATED_TOKEN_FILE is required") {
 		t.Errorf("secret: %v", err)
 	}
-	if _, err := load(t, nil, "BYWARD_ENTRA_TENANT=contoso.onmicrosoft.com"); !isConfigError(err) || !strings.Contains(err.Error(), "want the tenant ID, a GUID") {
+	if _, err := load(t, nil, "BYWARD_ENTRA_TENANT=contoso.onmicrosoft.com"); !isConfigError(err) || !strings.Contains(err.Error(), "BYWARD_ENTRA_TENANT: want the tenant ID, a GUID such as 00000000-0000-0000-0000-000000000000 (Entra admin center, Overview, Tenant ID); got a value (23 characters, not shown): it is not a GUID") {
 		t.Errorf("tenant: %v", err)
 	}
 	c, err := load(t, nil)
@@ -616,6 +624,10 @@ func TestOAuthRateLimitsDefaultToADR0018AndCanBeRaisedWithinBounds(t *testing.T)
 			t.Errorf("default %s = %d/min, want %d", ep, cfg.OAuthRateLimits[ep], n)
 		}
 	}
+	cfg, _, err = Load(nil, noAuthEnv("BYWARD_OAUTH_RATE_LIMITS=authorize=1, token=10000"), nil) // both bounds
+	if err != nil || cfg.OAuthRateLimits["authorize"] != 1 || cfg.OAuthRateLimits["token"] != 10000 {
+		t.Fatalf("the bounds: %v, %v; want both accepted", cfg.OAuthRateLimits, err)
+	}
 	cfg, _, err = Load(nil, noAuthEnv("BYWARD_OAUTH_RATE_LIMITS=authorize=120, token=600"), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -623,10 +635,22 @@ func TestOAuthRateLimitsDefaultToADR0018AndCanBeRaisedWithinBounds(t *testing.T)
 	if cfg.OAuthRateLimits["authorize"] != 120 || cfg.OAuthRateLimits["token"] != 600 || cfg.OAuthRateLimits["callback"] != 30 {
 		t.Errorf("overrides = %v, want authorize 120, token 600 and the other defaults", cfg.OAuthRateLimits)
 	}
-	for _, bad := range []string{"metadata=10", "authorize", "authorize=0", "authorize=10001", "authorize=fast", "authorize=-5"} {
-		if _, _, err := Load(nil, noAuthEnv("BYWARD_OAUTH_RATE_LIMITS="+bad), nil); err == nil || !strings.Contains(err.Error(), "BYWARD_OAUTH_RATE_LIMITS") {
-			t.Errorf("BYWARD_OAUTH_RATE_LIMITS=%q: want an error naming the setting, got %v", bad, err)
-		}
+	// An entry refused for its form by its place and length; a limit out of range as parsed.
+	const refused = "BYWARD_OAUTH_RATE_LIMITS: want endpoint=per-minute entries, the endpoint authorize, consent, callback, token, revoke or register and the limit a whole number from 1 to 10000; got entry 1 of 1"
+	for bad, why := range map[string]string{
+		"metadata=10":                " (11 characters, not shown): it is not endpoint=per-minute for one of the endpoints",
+		"authorize":                  " (9 characters, not shown): it is not endpoint=per-minute for one of the endpoints",
+		"authorize=fast":             " (14 characters, not shown): its limit is not a whole number",
+		"authorize=0":                ", authorize=0: the limit is out of range",
+		" authorize = 010001":        ", authorize=10001: the limit is out of range",
+		"authorize=-5":               ", authorize=-5: the limit is out of range",
+		"token=99999999999999999999": " (26 characters, not shown): its limit is out of range",
+	} {
+		t.Run(strconv.Quote(bad), func(t *testing.T) {
+			if _, _, err := Load(nil, noAuthEnv("BYWARD_OAUTH_RATE_LIMITS="+bad), nil); !isConfigError(err) || err.Error() != refused+why {
+				t.Errorf("got %v, want %q", err, refused+why)
+			}
+		})
 	}
 }
 
@@ -666,33 +690,37 @@ func TestSecretFilesNameTheFileEachSecretCameFrom(t *testing.T) {
 }
 
 func TestUpstreamHeaderTimeoutDefaultsToFiveMinutesWithinBounds(t *testing.T) {
+	const refused = "BYWARD_UPSTREAM_HEADER_TIMEOUT: want a duration from 1s to 1h, such as 5m; got "
 	cases := []struct {
-		env     string
-		want    time.Duration
-		wantErr bool
+		env  string
+		want time.Duration
+		err  string // the whole refusal, when refused
 	}{
-		{"", 5 * time.Minute, false},
-		{"BYWARD_UPSTREAM_HEADER_TIMEOUT=1s", time.Second, false},
-		{"BYWARD_UPSTREAM_HEADER_TIMEOUT=1h", time.Hour, false},
-		{"BYWARD_UPSTREAM_HEADER_TIMEOUT=999ms", 0, true},
-		{"BYWARD_UPSTREAM_HEADER_TIMEOUT=61m", 0, true},
-		{"BYWARD_UPSTREAM_HEADER_TIMEOUT=0s", 0, true},
-		{"BYWARD_UPSTREAM_HEADER_TIMEOUT=5", 0, true},
+		{"", 5 * time.Minute, ""},
+		{"BYWARD_UPSTREAM_HEADER_TIMEOUT=1s", time.Second, ""},
+		{"BYWARD_UPSTREAM_HEADER_TIMEOUT=1h", time.Hour, ""},
+		{"BYWARD_UPSTREAM_HEADER_TIMEOUT=999ms", 0, refused + "999ms: it is out of range"},
+		{"BYWARD_UPSTREAM_HEADER_TIMEOUT=61m", 0, refused + "1h1m0s: it is out of range"},
+		{"BYWARD_UPSTREAM_HEADER_TIMEOUT=0s", 0, refused + "0s: it is out of range"},
+		{"BYWARD_UPSTREAM_HEADER_TIMEOUT=3600001ms", 0, refused + "1h0m0.001s: it is out of range"}, // shown as parsed
+		{"BYWARD_UPSTREAM_HEADER_TIMEOUT=5", 0, refused + "a value (1 character, not shown): it is not a duration"},
 	}
 	for _, c := range cases {
-		var env []string
-		if c.env != "" {
-			env = []string{c.env}
-		}
-		cfg, _, err := Load(nil, noAuthEnv(env...), nil)
-		switch {
-		case c.wantErr && (err == nil || !strings.Contains(err.Error(), "BYWARD_UPSTREAM_HEADER_TIMEOUT")):
-			t.Errorf("%q: want an error naming the setting, got %v", c.env, err)
-		case !c.wantErr && err != nil:
-			t.Errorf("%q: %v", c.env, err)
-		case !c.wantErr && cfg.UpstreamHeaderTimeout != c.want:
-			t.Errorf("%q: timeout %s, want %s", c.env, cfg.UpstreamHeaderTimeout, c.want)
-		}
+		t.Run(c.env, func(t *testing.T) {
+			var env []string
+			if c.env != "" {
+				env = []string{c.env}
+			}
+			cfg, _, err := Load(nil, noAuthEnv(env...), nil)
+			switch {
+			case c.err != "" && (!isConfigError(err) || err.Error() != c.err):
+				t.Errorf("got %v, want %q", err, c.err)
+			case c.err == "" && err != nil:
+				t.Errorf("%v", err)
+			case c.err == "" && cfg.UpstreamHeaderTimeout != c.want:
+				t.Errorf("timeout %s, want %s", cfg.UpstreamHeaderTimeout, c.want)
+			}
+		})
 	}
 }
 
@@ -871,15 +899,17 @@ func TestInvalidStoreSettingsAreRejected(t *testing.T) {
 		// Every default derives from the data directory, so a relative one is reported, not the paths
 		// derived from it.
 		{"a relative data directory", []string{"BYWARD_DATA_DIR=data"}, "BYWARD_DATA_DIR: want an absolute path", "BYWARD_KEYS_DIR"},
+		// The one path setting with no default: given empty, it is refused as nothing given, not as relative.
+		{"an empty data directory", []string{"BYWARD_DATA_DIR="}, "BYWARD_DATA_DIR: want an absolute path; got nothing", "got a relative one"},
 		// The counter file derived from a relative keys directory is not reported a second time; one the
 		// operator sets is.
 		{"a counter derived from a relative keys directory", []string{"BYWARD_KEYS_DIR=keys"}, "BYWARD_KEYS_DIR: want an absolute path", "BYWARD_STORE_COUNTER_FILE"},
-		{"a relative counter beside a relative keys directory", []string{"BYWARD_KEYS_DIR=keys", "BYWARD_STORE_COUNTER_FILE=writes"}, `BYWARD_STORE_COUNTER_FILE: want an absolute path (no paths relative to the working directory, ADR-0007 §6), got a relative one`, ""},
-		{"counter inside the state directory", []string{"BYWARD_STORE_COUNTER_FILE=/var/lib/byward/state/writes"}, "is inside BYWARD_STORE_DIR", ""},
+		{"a relative counter beside a relative keys directory", []string{"BYWARD_KEYS_DIR=keys", "BYWARD_STORE_COUNTER_FILE=writes"}, `BYWARD_STORE_COUNTER_FILE: want an absolute path; got a relative one: no path is relative to the working directory (ADR-0007 §6)`, ""},
+		{"counter inside the state directory", []string{"BYWARD_STORE_COUNTER_FILE=/var/lib/byward/state/writes"}, "BYWARD_STORE_COUNTER_FILE: want a path outside BYWARD_STORE_DIR; got one inside it: a restored backup", ""},
 		{"keys inside the state directory", []string{"BYWARD_KEYS_DIR=/var/lib/byward/state/keys"}, "keep the keys directory outside the state directory", ""},
 		{"grace not a duration", []string{"BYWARD_REFRESH_GRACE=soon"}, "BYWARD_REFRESH_GRACE: want a duration", ""},
-		{"grace negative", []string{"BYWARD_REFRESH_GRACE=-1s"}, "want 0s to 60s", ""},
-		{"grace over a minute", []string{"BYWARD_REFRESH_GRACE=61s"}, "want 0s to 60s", ""},
+		{"grace negative", []string{"BYWARD_REFRESH_GRACE=-1000ms"}, "BYWARD_REFRESH_GRACE: want a duration from 0s to 60s, such as 30s; got -1s: it is out of range", "-1000ms"},
+		{"grace over a minute, shown as parsed", []string{"BYWARD_REFRESH_GRACE=61000ms"}, "BYWARD_REFRESH_GRACE: want a duration from 0s to 60s, such as 30s; got 1m1s: it is out of range", "61000ms"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1183,5 +1213,29 @@ func TestADenylistEntryRefusedAtWiringIsNamedByItsPlaceAndLength(t *testing.T) {
 				t.Errorf("got %v, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// A refused IdP brings its own refusal only: the settings that depend on the IdP are not refused
+// for it too, as an IdP of nothing.
+func TestARefusedIdPBringsNoOtherSettingsRefusalOfIt(t *testing.T) {
+	const want = "BYWARD_IDP: want entra, oidc, google, okta, auth0 or keycloak; got a value (5 characters, not shown): it is not one of them"
+	for name, env := range map[string][]string{
+		"app-only tokens": {"BYWARD_IDP=bogus", "BYWARD_APP_TOKENS=entra", "BYWARD_APP_ROLES=r"},
+		"On-Behalf-Of":    {"BYWARD_IDP=bogus", "BYWARD_OBO_SCOPES=https://graph.microsoft.com/User.Read"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := load(t, nil, env...); !isConfigError(err) || err.Error() != want {
+				t.Fatalf("err = %v, want only %q", err, want)
+			}
+		})
+	}
+}
+
+// An Entra tenant left unset is refused as required, and only so.
+func TestAnUnsetTenantIsRefusedOnlyAsRequired(t *testing.T) {
+	_, err := load(t, nil, "BYWARD_ENTRA_TENANT=")
+	if !isConfigError(err) || !strings.HasPrefix(err.Error(), "BYWARD_ENTRA_TENANT is required") || strings.Contains(err.Error(), "want the tenant ID") {
+		t.Fatalf("err = %v, want only the tenant's required error", err)
 	}
 }
