@@ -287,7 +287,7 @@ func TestASideFileOpenCannotTightenIsNamedWithoutItsPath(t *testing.T) {
 		t.Run(side, func(t *testing.T) {
 			dir := t.TempDir()
 			must(t, os.Symlink(side, filepath.Join(dir, side)))
-			_, err := Open(bounded(t), Options{Dir: dir, CounterFile: filepath.Join(t.TempDir(), "w")})
+			err := openErr(t, dir)
 			if want := `sqlite store: database file "` + side + `": too many levels of symbolic links`; err == nil || err.Error() != want {
 				t.Fatalf("err = %v, want %q", err, want)
 			}
@@ -302,9 +302,63 @@ func TestAWriteProbeThatCannotBeRemovedFailsOpenWithoutItsPath(t *testing.T) {
 	t.Cleanup(func() { removeProbe = os.Remove })
 	removeProbe = func(name string) error { return &fs.PathError{Op: "remove", Path: name, Err: syscall.EPERM} }
 	dir := t.TempDir()
-	_, err := Open(bounded(t), Options{Dir: dir, CounterFile: filepath.Join(t.TempDir(), "w")})
+	err := openErr(t, dir)
 	if want := "sqlite store: the state directory: " + syscall.EPERM.Error(); err == nil || err.Error() != want || !errors.Is(err, syscall.EPERM) {
 		t.Fatalf("err = %v, want %q", err, want)
+	}
+}
+
+// openErr opens a store in dir, its counter file elsewhere, where the test expects Open to fail,
+// and returns Open's error; a store that opens anyway is closed.
+func openErr(t *testing.T, dir string) error {
+	t.Helper()
+	s, err := Open(bounded(t), Options{Dir: dir, CounterFile: filepath.Join(t.TempDir(), "w")})
+	if err == nil {
+		_ = s.Close()
+	}
+	return err
+}
+
+// A database file the proxy cannot tighten or close is named by its quoted name and the cause, never
+// its path (security invariant 2, #600): only a fault fails either on a file it just opened.
+func TestADatabaseFileThatCannotBeTightenedOrClosedIsNamedWithoutItsPath(t *testing.T) {
+	t.Cleanup(func() { chmodDatabaseFile, closeDatabaseFile = (*os.File).Chmod, (*os.File).Close })
+	for _, tc := range []struct {
+		name    string
+		breakIt func()
+	}{
+		{"tighten", func() {
+			chmodDatabaseFile = func(f *os.File, _ os.FileMode) error {
+				return &fs.PathError{Op: "chmod", Path: f.Name(), Err: syscall.EIO}
+			}
+		}},
+		{"close", func() {
+			closeDatabaseFile = func(f *os.File) error {
+				_ = f.Close()
+				return &fs.PathError{Op: "close", Path: f.Name(), Err: syscall.EIO}
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			chmodDatabaseFile, closeDatabaseFile = (*os.File).Chmod, (*os.File).Close
+			tc.breakIt()
+			err := openErr(t, t.TempDir())
+			if want := `sqlite store: database file "byward.db": ` + syscall.EIO.Error(); err == nil || err.Error() != want || !errors.Is(err, syscall.EIO) {
+				t.Fatalf("err = %v, want %q", err, want)
+			}
+		})
+	}
+}
+
+// A database file an operator command cannot stat, such as a symlink loop, is named by its quoted
+// name and the cause, never its path (security invariant 2, #600). present is called directly: through
+// Open, ensureFile reports the same loop, so a present that missed it would pass.
+func TestADatabaseFileAnOperatorOpenCannotStatIsNamedWithoutItsPath(t *testing.T) {
+	dir := t.TempDir()
+	must(t, os.Symlink(fileName, filepath.Join(dir, fileName)))
+	err := present(bounded(t), filepath.Join(dir, fileName))
+	if want := `sqlite store: database file "byward.db": too many levels of symbolic links`; err == nil || err.Error() != want || !errors.Is(err, syscall.ELOOP) {
+		t.Fatalf("present = %v, want %q", err, want)
 	}
 }
 
@@ -317,7 +371,7 @@ func TestUnwritableStateDirectoryFailsOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) }) //nolint:gosec // G302: directory mode, restored for cleanup
-	_, err := Open(bounded(t), Options{Dir: dir, CounterFile: filepath.Join(t.TempDir(), "w")})
+	err := openErr(t, dir)
 	if err == nil || err.Error() != "sqlite store: the state directory is not writable: permission denied" || !errors.Is(err, fs.ErrPermission) {
 		t.Fatalf("err = %v, want the state directory named unwritable, by what it is, never its path", err)
 	}
@@ -346,7 +400,7 @@ func TestNewerSchemaIsRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	must(t, db.Close())
-	_, err := Open(bounded(t), Options{Dir: dir, CounterFile: filepath.Join(t.TempDir(), "w")})
+	err := openErr(t, dir)
 	if err == nil || !strings.Contains(err.Error(), "newer than this binary") {
 		t.Fatalf("err = %v, want the downgrade refusal", err)
 	}
@@ -686,6 +740,53 @@ func TestAFailedCounterWriteStoresNothingAndIsNamedWithoutAPath(t *testing.T) {
 	}
 }
 
+// A counter write whose temporary file cannot be synced or closed stores nothing and leaves no
+// temporary file, and the error names the counter file and each cause, never a path (security
+// invariant 2, #600): only a fault fails either, and both failing joins two errors, each stripped of
+// its path.
+func TestACounterFileThatCannotBeSyncedOrClosedIsNamedWithoutItsPath(t *testing.T) {
+	t.Cleanup(func() { syncCounterFile, closeCounterFile = (*os.File).Sync, (*os.File).Close })
+	failSync := func() {
+		syncCounterFile = func(f *os.File) error { return &fs.PathError{Op: "sync", Path: f.Name(), Err: syscall.EIO} }
+	}
+	failClose := func() {
+		closeCounterFile = func(f *os.File) error {
+			_ = f.Close()
+			return &fs.PathError{Op: "close", Path: f.Name(), Err: syscall.EIO}
+		}
+	}
+	for _, tc := range []struct {
+		name    string
+		breakIt []func()
+		want    string
+	}{
+		{"sync", []func(){failSync}, "sqlite store: counter file: input/output error"},
+		{"close", []func(){failClose}, "sqlite store: counter file: input/output error"},
+		{"both", []func(){failSync, failClose}, "sqlite store: counter file: input/output error\ninput/output error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			syncCounterFile, closeCounterFile = (*os.File).Sync, (*os.File).Close
+			cdir := t.TempDir()
+			s := open(t, t.TempDir(), filepath.Join(cdir, "writes"))
+			for _, b := range tc.breakIt {
+				b()
+			}
+			_, err := s.CreateGrant(ctx, grant("g1", "tid:a"))
+			if err == nil || err.Error() != tc.want || !errors.Is(err, syscall.EIO) {
+				t.Fatalf("CreateGrant = %q, want %q", err, tc.want)
+			}
+			if _, err := s.Grant(ctx, "g1"); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("the failed write was stored: %v", err)
+			}
+			entries, err := os.ReadDir(cdir)
+			must(t, err)
+			if len(entries) != 1 || entries[0].Name() != "writes" {
+				t.Fatalf("the counter directory holds %v, want only the counter file", entries)
+			}
+		})
+	}
+}
+
 func TestCorruptCounterFileFailsOpen(t *testing.T) {
 	for name, content := range map[string]string{"not a number": "not a number", "negative": "-1", "empty": ""} {
 		t.Run(name, func(t *testing.T) {
@@ -754,9 +855,8 @@ func TestFailedMigrationChangesNothing(t *testing.T) {
 	migrations = append(append([]string{}, saved...), "CREATE TABLE half_done (a); UPDATE grants SET subject = 'x'; SELECT * FROM no_such_table;")
 	t.Cleanup(func() { migrations = saved })
 
-	s, err := Open(bounded(t), Options{Dir: dir, CounterFile: filepath.Join(t.TempDir(), "w")})
+	err := openErr(t, dir)
 	if err == nil {
-		_ = s.Close()
 		t.Fatal("Open succeeded although a migration fails")
 	}
 	if want := fmt.Sprintf("migrate to v%d", len(saved)+1); !strings.Contains(err.Error(), want) {

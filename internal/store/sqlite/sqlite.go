@@ -102,7 +102,7 @@ func CheckPaths(opts Options) error {
 			// Open creates the database through a symlink whose target's directory exists (O_CREATE);
 			// SQLite does not do that for its WAL and SHM files.
 			if err := regularIfPresent(f, name == fileName); err != nil {
-				return fmt.Errorf("sqlite store: database file %q: %w", name, err)
+				return databaseFileError(name, err)
 			}
 		}
 	case errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR):
@@ -133,13 +133,14 @@ func CheckPaths(opts Options) error {
 
 // regularIfPresent refuses an entry at path that is not a regular file, or a symlink to nothing;
 // with creatable, a symlink to a missing file in an existing directory passes, as O_CREATE makes it.
+// Its Lstat error is returned as it is, path included: CheckPaths, its caller, strips it.
 func regularIfPresent(path string, creatable bool) error {
 	fi, err := os.Lstat(path)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		return nil
 	case err != nil:
-		return logging.FileError(err)
+		return err
 	case fi.Mode()&os.ModeSymlink != 0:
 		if fi, err = os.Stat(path); err != nil {
 			if creatable && targetDirExists(path) {
@@ -274,7 +275,7 @@ func present(ctx context.Context, path string) error {
 	case errors.Is(err, syscall.ENOTDIR):
 		return fmt.Errorf("%w: the state directory, or a directory above it, is not a directory", store.ErrNoStore)
 	case err != nil:
-		return fmt.Errorf("sqlite store: database file %q: %w", fileName, logging.FileError(err))
+		return databaseFileError(fileName, err)
 	}
 	// SQLite would create a WAL database's side files beside a file it cannot write, and could not
 	// remove them; the open that follows reports such a file.
@@ -856,24 +857,40 @@ func probeWritable(dir string) error {
 	return nil
 }
 
+// databaseFileError names the database file, or one of its side files, by name and the cause, never
+// its path (security invariant 2).
+func databaseFileError(name string, err error) error {
+	return fmt.Errorf("sqlite store: database file %q: %w", name, logging.FileError(err))
+}
+
+// chmodDatabaseFile and closeDatabaseFile are (*os.File).Chmod and Close; tests replace them to fail
+// ensureFile's chmod and close, which on a file the proxy just opened only a fault does.
+var (
+	chmodDatabaseFile = (*os.File).Chmod
+	closeDatabaseFile = (*os.File).Close
+)
+
 // ensureFile creates the database file with mode 0600, or tightens an existing one, together with
 // leftover -wal and -shm files. SQLite creates new -wal and -shm files with the database file's
 // mode.
 func ensureFile(path string) error {
 	for _, side := range []string{path + "-wal", path + "-shm"} {
 		if err := os.Chmod(side, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("sqlite store: database file %q: %w", filepath.Base(side), logging.FileError(err))
+			return databaseFileError(filepath.Base(side), err)
 		}
 	}
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600) //nolint:gosec // G304: the operator's state directory
 	if err != nil {
-		return fmt.Errorf("sqlite store: database file %q: %w", filepath.Base(path), logging.FileError(err))
+		return databaseFileError(filepath.Base(path), err)
 	}
-	if err := f.Chmod(0o600); err != nil {
+	if err := chmodDatabaseFile(f, 0o600); err != nil {
 		_ = f.Close()
-		return fmt.Errorf("sqlite store: database file %q: %w", filepath.Base(path), logging.FileError(err))
+		return databaseFileError(filepath.Base(path), err)
 	}
-	return f.Close()
+	if err := closeDatabaseFile(f); err != nil {
+		return databaseFileError(filepath.Base(path), err)
+	}
+	return nil
 }
 
 // CreateClient implements store.Clients.
