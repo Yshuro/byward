@@ -126,30 +126,57 @@ func TestASecretSetToNothingBesideItsFileLoadsAsTheFileAlone(t *testing.T) {
 
 // A flag set to nothing on the command line is deliberate, so it is refused as given, unlike a
 // variable set to nothing (#428). An empty claims flag never quietly means none: that would change
-// what the upstream is told, so it is refused beside a stdio upstream too, as an empty assertion
-// header is.
+// what the upstream is told. An empty credential header flag is given too, so with no credential it
+// is refused as a header with nothing to send. (A flag set to nothing for a family that is off is
+// refused by that family's check:
+// TestEveryOffCheckRefusesAFlagSetToNothingAndTakesAVariableSetToNothingAsUnset.)
 func TestAFlagSetToNothingIsRefusedAsGiven(t *testing.T) {
-	stdio := stdioBase(stdioCommand)
-	claims := "BYWARD_ASSERTION_CLAIMS: want claims from roles, groups, email or name, or none; got nothing"
-	header := "BYWARD_ASSERTION_HEADER: want a header name such as Authorization or X-Byward-Identity; got nothing"
-	for _, tc := range []struct {
-		flag string
-		env  []string
-		want string
-	}{
-		{"--listen=", base, "BYWARD_LISTEN: want host:port such as 127.0.0.1:8080; got nothing"},
-		{"--scope=", base, "BYWARD_SCOPE: want one scope token, such as mcp; got nothing"},
-		{"--data-dir=", base, "BYWARD_DATA_DIR: want an absolute path, one starting with /; got nothing"},
-		{"--store-postgres-dsn-file=", base, "--store-postgres-dsn-file: want the path of a file holding the secret, such as /run/secrets/store-postgres-dsn; got nothing"},
+	for _, tc := range []struct{ flag, want string }{
+		{"--listen=", "BYWARD_LISTEN: want host:port such as 127.0.0.1:8080; got nothing"},
+		{"--scope=", "BYWARD_SCOPE: want one scope token, such as mcp; got nothing"},
+		{"--data-dir=", "BYWARD_DATA_DIR: want an absolute path, one starting with /; got nothing"},
+		{"--store-postgres-dsn-file=", "--store-postgres-dsn-file: want the path of a file holding the secret, such as /run/secrets/store-postgres-dsn; got nothing"},
 		// The flag wins over BYWARD_ENTRA_CLIENT_SECRET_FILE, which base sets, and is still refused.
-		{"--entra-client-secret-file=", base, "--entra-client-secret-file: want the path of a file holding the secret, such as /run/secrets/entra-client-secret; got nothing"},
-		{"--assertion-claims=", base, claims},
-		{"--assertion-claims=", stdio, claims},
-		{"--assertion-header=", base, header},
-		{"--assertion-header=", stdio, header},
+		{"--entra-client-secret-file=", "--entra-client-secret-file: want the path of a file holding the secret, such as /run/secrets/entra-client-secret; got nothing"},
+		{"--assertion-claims=", "BYWARD_ASSERTION_CLAIMS: want claims from roles, groups, email or name, or none; got nothing"},
+		{"--assertion-header=", "BYWARD_ASSERTION_HEADER: want a header name such as Authorization or X-Byward-Identity; got nothing"},
+		{"--upstream-credential-header=", "BYWARD_UPSTREAM_CREDENTIAL_HEADER is set, but there is no credential: set BYWARD_UPSTREAM_CREDENTIAL_FILE too, or remove it"},
 	} {
-		if _, _, err := Load([]string{tc.flag}, tc.env, baseFiles); !isConfigError(err) || err.Error() != tc.want {
-			t.Errorf("%s beside %s: %v, want the error %q", tc.flag, tc.env, err, tc.want)
+		if _, err := load(t, []string{tc.flag}); !isConfigError(err) || err.Error() != tc.want {
+			t.Errorf("%s: %v, want the error %q", tc.flag, err, tc.want)
 		}
+	}
+}
+
+// Every check that refuses a family's settings while the family is off refuses one given as a flag
+// set to nothing, which is deliberate, and takes one set to nothing as a variable as unset, as env
+// templates list every variable (#428, #596). A setting of each check (both of the SQLite store's
+// beside PostgreSQL, which it checks apart); the upstream mode's check is walked over every setting in
+// TestEverySettingForOneUpstreamModeIsRefusedWithTheOtherMode.
+func TestEveryOffCheckRefusesAFlagSetToNothingAndTakesAVariableSetToNothingAsUnset(t *testing.T) {
+	stdio := stdioBase(stdioCommand)
+	postgres := append(slices.Clone(base), "BYWARD_STORE_POSTGRES_DSN_FILE="+dsnFile)
+	for _, tc := range []struct {
+		check, setting string
+		env            []string
+		want           string
+	}{
+		{"the other IdP family", "oidc-scopes", base, "--oidc-scopes cannot be used with BYWARD_IDP=entra"},
+		{"app tokens off", "app-roles", base, "--app-roles set while BYWARD_APP_TOKENS=off"},
+		{"On-Behalf-Of's header beside a stdio upstream", "obo-header", stdio, "--obo-header: a stdio upstream gets its downstream token from its token socket"},
+		{"the SQLite store beside PostgreSQL", "store-dir", postgres, "give one store, PostgreSQL or a SQLite state directory, not both"},
+		{"the SQLite counter file beside PostgreSQL", "store-counter-file", postgres, "--store-counter-file: the counter file belongs to the SQLite store"},
+		{"authentication beside --insecure-no-auth", "gate-roles", anon, "BYWARD_INSECURE_NO_AUTH cannot be combined with --gate-roles"},
+		{"a stdio setting beside an HTTP upstream", "stdio-max-processes", base, "--stdio-max-processes is set, but the upstream is HTTP: it applies only to a stdio upstream"},
+	} {
+		t.Run(tc.check, func(t *testing.T) {
+			if _, _, err := Load([]string{"--" + tc.setting + "="}, tc.env, filesPlusEmptyAndBlank); !isConfigError(err) || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("--%s=: %v, want an error containing %q", tc.setting, err, tc.want)
+			}
+			env := Setting{Name: tc.setting}.Env() + "="
+			if _, _, err := Load(nil, append(slices.Clone(tc.env), env), filesPlusEmptyAndBlank); err != nil {
+				t.Errorf("%s: %v, want it unset", env, err)
+			}
+		})
 	}
 }

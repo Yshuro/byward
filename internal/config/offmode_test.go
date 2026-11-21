@@ -1,6 +1,7 @@
 package config
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -76,10 +77,12 @@ func TestASettingForTheUpstreamModeThatIsOffIsRefused(t *testing.T) {
 // from the registry, so a setting added to one is covered with no test to edit; the HTTP-only
 // settings of other groups are named here. Every other setting of the identity and downstream-token
 // groups must be named as applying to both modes or refusing stdio with its own hint, so a new one
-// fails until someone decides which mode it is for. The selectors and the credential, which keep
-// their own errors, are the only exceptions.
+// fails until someone decides which mode it is for. Each is refused given a value, and, but for a
+// secret (which takes no flag of its own), as a flag set to nothing, which is deliberate (#596). The
+// credential, which keeps its own hint, is the one exception; the selectors are too for a value, as
+// with both set there is no mode.
 func TestEverySettingForOneUpstreamModeIsRefusedWithTheOtherMode(t *testing.T) {
-	skipped := map[string]bool{"upstream-url": true, "upstream-command": true, "upstream-credential": true}
+	skipped := map[string]bool{"upstream-url": true, "upstream-command": true} // given a value: the "both set" error
 	httpOnlySettings := map[string]bool{"assertion-keys-dir": true, "assertion-header": true, "assertion-claims": true, "assertion-unverified-email": true}
 	notOffMode := map[string]bool{"obo-scopes": true, "identity-headers": true, "obo-header": true} // both modes; own hints
 	files := func(p string) ([]byte, error) {
@@ -88,62 +91,45 @@ func TestEverySettingForOneUpstreamModeIsRefusedWithTheOtherMode(t *testing.T) {
 		}
 		return baseFiles(p)
 	}
-	n := 0
+	n, ran, flags := 0, 0, 0
 	for _, s := range registry {
 		forHTTP := s.Group == GroupHTTPUpstream || httpOnlySettings[s.Name]
 		if (s.Group == GroupIdentity || s.Group == GroupDownstreamTokens) && !forHTTP && !notOffMode[s.Name] {
 			t.Errorf("%s: list it in httpOnly and httpOnlySettings if only an HTTP upstream reads it, else in notOffMode (both modes, or its own stdio hint)", s.Name)
 		}
-		if !forHTTP && s.Group != GroupStdioUpstream || skipped[s.Name] {
+		if !forHTTP && s.Group != GroupStdioUpstream || s.Name == "upstream-credential" {
 			continue
 		}
 		n++
 		t.Run(s.Name, func(t *testing.T) {
+			ran++
+			modeEnv, mode := append([]string{}, base...), "HTTP"
+			if forHTTP {
+				modeEnv, mode = stdioBase(stdioCommand), "stdio"
+			}
+			if !s.Secret() {
+				flags++
+				flag := "--" + s.Name
+				_, _, err := Load([]string{flag + "="}, modeEnv, files)
+				if want := flag + " is set, but the upstream is " + mode; !isConfigError(err) || !strings.Contains(err.Error(), want) {
+					t.Errorf("%s=: err = %v, want a config error containing %q", flag, err, want)
+				}
+			}
+			if skipped[s.Name] {
+				return
+			}
 			given := s.Env() + "=x"
 			if s.Secret() {
 				given = s.Env() + "_FILE=/run/secrets/off-mode"
 			}
-			env, mode := append(append([]string{}, base...), given), "HTTP"
-			if forHTTP {
-				env, mode = stdioBase(stdioCommand, given), "stdio"
-			}
-			_, _, err := Load(nil, env, files)
+			_, _, err := Load(nil, append(slices.Clone(modeEnv), given), files)
 			if want := strings.SplitN(given, "=", 2)[0] + " is set, but the upstream is " + mode; !isConfigError(err) || !strings.Contains(err.Error(), want) {
 				t.Fatalf("err = %v, want a config error containing %q", err, want)
 			}
 		})
 	}
-	if n < 11 {
-		t.Fatalf("%d upstream-mode settings checked, want every one (11 today)", n)
-	}
-}
-
-// Configurations that load: each mode with the other's settings at their defaults, or given empty,
-// as env templates list every variable; an empty value is not given, so it is no off-mode setting.
-// The other mode's selector given empty selects nothing. (An empty assertion header or claims flag is
-// refused by its own parser even beside a stdio upstream: TestAFlagSetToNothingIsRefusedAsGiven.)
-func TestEachModeLoadsBesideTheOtherModesDefaultsAndEmptyValues(t *testing.T) {
-	command := stdioCommand
-	for _, tc := range []struct {
-		name string
-		args []string
-		env  []string
-	}{
-		{"an HTTP upstream", nil, base},
-		{"a stdio upstream", nil, stdioBase(command)},
-		{"an HTTP upstream with an empty command", nil, append(append([]string{}, base...), "BYWARD_UPSTREAM_COMMAND=")},
-		{"a stdio upstream with an empty URL", nil, stdioBase(command, "BYWARD_UPSTREAM_URL=")},
-		{"an HTTP upstream with an empty stdio setting", nil, append(append([]string{}, base...), "BYWARD_STDIO_MAX_PROCESSES=")},
-		{"an HTTP upstream with an empty stdio flag", []string{"--stdio-max-processes="}, base},
-		{"a stdio upstream with an empty HTTP setting", nil, stdioBase(command, "BYWARD_UPSTREAM_STRIP_HEADERS=")},
-		{"a stdio upstream with an empty assertion key directory", nil, stdioBase(command, "BYWARD_ASSERTION_KEYS_DIR=")},
-		{"a stdio upstream with empty assertion claims", nil, stdioBase(command, "BYWARD_ASSERTION_CLAIMS=")},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if _, _, err := Load(tc.args, tc.env, baseFiles); err != nil {
-				t.Fatal(err)
-			}
-		})
+	if ran == n && (n < 13 || flags < 12) { // a -run filter runs only some
+		t.Fatalf("%d upstream-mode settings checked, %d as a flag set to nothing; want every one (13 today, 12 but the secret upstream-env)", n, flags)
 	}
 }
 
