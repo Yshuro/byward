@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -310,4 +312,113 @@ func allSettings(t *testing.T, env []string) []config.Setting {
 		out = append(out, v.Setting)
 	}
 	return out
+}
+
+// byward init shows a value it was given only in the script it prints, which is the script's purpose
+// (#576). Every form of a secret, and a secret in a URL's host, is given in each place: as the IdP's
+// name, alone and with each refusal init makes before it reads the name; as each of init's flags; as
+// BYWARD_PUBLIC_URL and BYWARD_UPSTREAM_URL, alone and with an undefined flag; as an undefined flag,
+// with and without a value; in a bad flag syntax; and as an extra argument. Each cell must reach its
+// own refusal, which names a refused value only by its length, as config does (#512), or for a URL be
+// accepted, and show the value in no refusal, on stderr or stdout. Nothing reaches os.Stderr or the log
+// package either: the flag package writes to os.Stderr unless told otherwise, defaults from the
+// environment included.
+func TestInitShowsAValueItWasGivenOnlyInTheScriptItPrints(t *testing.T) {
+	const usage = "byward: usage: byward init entra --tenant <tenant-id> [--public-url <url>] [--upstream-url <url>] [--secret-years 1|2] [--credential secret|certificate]\n"
+	processStderr := redirectStderr(t)
+	base := []string{"--tenant", tenant, "--public-url", "https://m.example/mcp"}
+	entra := func(extra ...string) []string { return append(append([]string{"init", "entra"}, base...), extra...) }
+	// Each of init's flags, by the refusal its value reaches; a URL init accepts is printed.
+	flagRefusals := map[string]struct {
+		want     string
+		accepted bool
+	}{
+		"tenant":       {"the tenant must be the tenant ID", false},
+		"public-url":   {"BYWARD_PUBLIC_URL", true},
+		"upstream-url": {"BYWARD_UPSTREAM_URL", true},
+		"secret-years": {"--secret-years: want a whole number of years; got a value it does not take (not shown)", false},
+		"credential":   {"the credential must be secret or certificate; got another value (", false},
+	}
+	fs, _ := newInitFlags(nil)
+	fs.VisitAll(func(f *flag.Flag) {
+		if _, ok := flagRefusals[f.Name]; !ok {
+			t.Errorf("init's flag --%s has no cell here", f.Name)
+		}
+	})
+	type cell struct {
+		place, want string
+		exact       bool // want is all of stderr
+		accepted    bool // a URL init may accept, and print
+		args, env   []string
+	}
+	for _, form := range append(slices.Clone(secretForms), hostForm) {
+		v := form.value
+		cells := []cell{
+			{place: "the IdP's name", want: "the IdP must be entra; got another name (", args: append([]string{"init", v}, base...)},
+			{place: "the IdP's name, with an undefined flag", want: "got an undefined flag (4 characters, not shown)", args: []string{"init", v, "--tenant", tenant, "--nope"}},
+			{place: "the IdP's name, asking for help", want: usage, exact: true, args: []string{"init", v, "-h"}},
+			{place: "the IdP's name, with a flag without its value", want: "flag needs an argument: -tenant", args: []string{"init", v, "--tenant"}},
+			{place: "the IdP's name, without a tenant", want: usage, exact: true, args: []string{"init", v, "--public-url", "https://m.example/mcp"}},
+			{place: "the IdP's name, with an extra argument", want: usage, exact: true, args: append(append([]string{"init", v}, base...), "now")},
+			{place: "the IdP's name, with a bad lifetime", want: "--secret-years: want", args: append(append([]string{"init", v}, base...), "--secret-years=x")},
+			{place: "the IdP's name, without a public URL", want: "BYWARD_PUBLIC_URL is required", args: []string{"init", v, "--tenant", tenant}},
+			{place: "the IdP's name, with a bad upstream URL", want: "BYWARD_UPSTREAM_URL: want", args: append(append([]string{"init", v}, base...), "--upstream-url=ftp://up.example/mcp")},
+			{place: "BYWARD_PUBLIC_URL", want: "BYWARD_PUBLIC_URL", accepted: true, args: []string{"init", "entra", "--tenant", tenant}, env: []string{"BYWARD_PUBLIC_URL=" + v}},
+			{place: "BYWARD_UPSTREAM_URL", want: "BYWARD_UPSTREAM_URL", accepted: true, args: entra(), env: []string{"BYWARD_UPSTREAM_URL=" + v}},
+			{place: "BYWARD_PUBLIC_URL, with an undefined flag", want: "got an undefined flag (4 characters, not shown)", args: []string{"init", "entra", "--tenant", tenant, "--nope"}, env: []string{"BYWARD_PUBLIC_URL=" + v}},
+			{place: "BYWARD_UPSTREAM_URL, with an undefined flag", want: "got an undefined flag (4 characters, not shown)", args: entra("--nope"), env: []string{"BYWARD_UPSTREAM_URL=" + v}},
+			// The flag package ends a flag's name at its first =, so the form is given once with each = replaced.
+			{place: "an undefined flag", want: "got an undefined flag (", args: entra("--" + strings.ReplaceAll(v, "=", "_"))},
+			{place: "an undefined flag with a value", want: "got an undefined flag (", args: entra("--" + v)},
+			{place: "a bad flag syntax", want: "got an argument with a bad flag syntax (", args: entra("---" + v)},
+			{place: "an extra argument", want: usage, exact: true, args: entra(v)},
+		}
+		for name, r := range flagRefusals {
+			cells = append(cells, cell{place: "--" + name, want: r.want, accepted: r.accepted, args: entra("--" + name + "=" + v)})
+		}
+		for _, c := range cells {
+			t.Run(c.place+"/"+form.name, func(t *testing.T) {
+				code, stdout, stderr := runWith(c.args, c.env...)
+				if shows(stderr) || code != exitOK && shows(stdout) {
+					t.Errorf("exit %d; stdout %q, stderr %q show the value given", code, stdout, stderr)
+				}
+				if got := processStderr(t); got != "" {
+					t.Errorf("init wrote %q to os.Stderr or the log package, want nothing", got)
+				}
+				if code == exitOK && c.accepted {
+					return
+				}
+				if code != exitConfig || !c.exact && !strings.Contains(stderr, c.want) || c.exact && stderr != c.want {
+					t.Errorf("exit %d, stderr %q; want exit %d and the refusal %q", code, stderr, exitConfig, c.want)
+				}
+			})
+		}
+	}
+}
+
+// redirectStderr sends os.Stderr and the log package (slog's default logger writes through it) to a file
+// until the test ends, and returns a function that reads what was written there since it last read, failing
+// the test (or subtest) it is given if it cannot. It swaps variables, not file descriptor 2. No test in
+// this package runs in parallel, so none writes there meanwhile.
+func redirectStderr(t *testing.T) func(*testing.T) string {
+	t.Helper()
+	f, err := os.Create(filepath.Join(t.TempDir(), "stderr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, savedLog := os.Stderr, log.Writer()
+	os.Stderr = f
+	log.SetOutput(f)
+	t.Cleanup(func() { os.Stderr = saved; log.SetOutput(savedLog); _ = f.Close() })
+	read := 0
+	return func(t *testing.T) string {
+		t.Helper()
+		b, err := os.ReadFile(f.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := string(b[read:])
+		read = len(b)
+		return got
+	}
 }
