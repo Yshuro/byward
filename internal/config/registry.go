@@ -43,6 +43,27 @@ type Setting struct {
 // `--<name>-file`, and never shown. Its shape decides it.
 func (s Setting) Secret() bool { return s.shape == secretShape }
 
+// HoldsPath reports whether the setting's value is a path the proxy reads or writes: a file that
+// cannot be used is named by the setting and the cause, never the path (security invariant 2, #587).
+// Its shape decides it. A secret's file is a path too, given as `<ENV>_FILE` or `--<name>-file`,
+// but the secret has the secret shape, so HoldsPath is false for it; PathVariables lists its file.
+func (s Setting) HoldsPath() bool { return s.shape == pathShape }
+
+// PathVariables are the environment variables whose values are paths: each path setting's, and each
+// secret's `<ENV>_FILE` (security invariant 2, #587). A test requires a leak-test scenario for each.
+func PathVariables() []string {
+	var out []string
+	for _, s := range registry {
+		switch {
+		case s.HoldsPath():
+			out = append(out, s.Env())
+		case s.Secret():
+			out = append(out, s.Env()+"_FILE")
+		}
+	}
+	return out
+}
+
 // Env is the setting's environment variable name.
 func (s Setting) Env() string {
 	return envPrefix + strings.ToUpper(strings.ReplaceAll(s.Name, "-", "_"))

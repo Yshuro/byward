@@ -349,53 +349,18 @@ func TestAFlagTheFlagPackageRefusesNeverShowsTheTextGiven(t *testing.T) {
 }
 
 // Every setting's refusal, tried with values that hold a canary in a context where the setting is
-// read, never shows the canary, in any case, and every line that refuses the setting is in the one
-// format "BYWARD_X: want …; got …" (ADR-0031 §1). Config's own counterpart of cmd/byward's
+// read (readContextOf), never shows the canary, in any case, and every line that refuses the setting
+// is in the one format "BYWARD_X: want …; got …" (ADR-0031 §1). Config's own counterpart of cmd/byward's
 // TestNoCommandShowsAHiddenOrARefusedValue, which runs the refused cells through every command. A
 // secret setting is read from a file, which that test writes; a line naming the setting otherwise
 // ("BYWARD_X is set without …") refuses its context, not a value.
 func TestNoRefusalShowsTheValueGiven(t *testing.T) {
 	forms := []string{"https://u:" + canaryText + "@h.example/x", canaryText, "X-Api-Key: " + canaryText, "a " + canaryText,
 		"+" + canaryText, canaryText + "=5", "authorize=" + canaryText, "1" + canaryText, "\"" + canaryText + "\""}
-	type ctx struct {
-		args  []string
-		env   []string
-		files readFileFunc
-	}
-	credFiles := func(p string) ([]byte, error) {
-		if p == credFile {
-			return []byte("k-123"), nil
-		}
-		return baseFiles(p)
-	}
-	withoutOIDCSecret := slices.DeleteFunc(slices.Clone(oidcBase), func(kv string) bool { return strings.HasPrefix(kv, "BYWARD_OIDC_CLIENT_SECRET_FILE=") })
-	// A context where each setting is read: by its group, and for these by the settings it needs beside it.
-	special := map[string]ctx{
-		"upstream-command":           {nil, stdioBase(), baseFiles}, // given as itself, not after --
-		"tls-cert-file":              {nil, append(slices.Clone(base), "BYWARD_TLS_KEY_FILE=/run/tls/tls.key"), baseFiles},
-		"tls-key-file":               {nil, append(slices.Clone(base), "BYWARD_TLS_CERT_FILE=/run/tls/tls.crt"), baseFiles},
-		"entra-federated-token-file": {nil, withoutSecret(), baseFiles},
-		"upstream-credential-header": {nil, append(slices.Clone(base), "BYWARD_UPSTREAM_CREDENTIAL_FILE="+credFile), credFiles},
-		"oidc-client-key-alg":        {nil, append(slices.Clone(withoutOIDCSecret), "BYWARD_OIDC_CLIENT_KEY_FILE=/run/secrets/key.pem"), oidcFiles},
-		"oidc-client-key-id":         {nil, append(slices.Clone(withoutOIDCSecret), "BYWARD_OIDC_CLIENT_KEY_FILE=/run/secrets/key.pem"), oidcFiles},
-	}
-	contextOf := func(s Setting) ctx {
-		if c, ok := special[s.Name]; ok {
-			return ctx{c.args, slices.Clone(c.env), c.files}
-		}
-		switch s.Group {
-		case GroupStdioUpstream:
-			return ctx{[]string{"--", "/bin/x"}, stdioBase(), baseFiles}
-		case GroupOIDC:
-			return ctx{nil, slices.Clone(oidcBase), oidcFiles}
-		case GroupAppOnly:
-			return ctx{nil, append(slices.Clone(base), "BYWARD_APP_TOKENS=entra", "BYWARD_APP_ROLES=r"), baseFiles}
-		}
-		return ctx{nil, slices.Clone(base), baseFiles}
-	}
 	// The settings config refuses none of these forms for: free text, client IDs, claim and role names,
 	// and the gate and app lists. Every other setting must refuse one in the one format, so the test cannot
-	// pass by no longer reaching its parser.
+	// pass by no longer reaching its parser. Those listed must load with every form, so a context that
+	// stops reaching them fails too.
 	acceptsEveryForm := []string{"app-client-ids", "app-roles", "gate-email-domains", "gate-groups",
 		"gate-hosted-domains", "gate-roles", "gate-tenants", "oidc-client-id", "oidc-client-key-id", "oidc-groups-claim",
 		"oidc-name", "oidc-roles-claim", "oidc-subject-claim", "operator-name", "resource-name", "scope-description"}
@@ -405,10 +370,13 @@ func TestNoRefusalShowsTheValueGiven(t *testing.T) {
 		}
 		inFormat := 0
 		for _, form := range forms {
-			c := contextOf(s)
+			c := readContextOf(s)
 			_, _, err := Load(c.args, append(c.env, s.Env()+"="+form), c.files)
 			if err == nil {
 				continue
+			}
+			if slices.Contains(acceptsEveryForm, s.Name) { // so a context that does not reach it fails here
+				t.Errorf("%s=%q: %v; acceptsEveryForm lists it, so it must load with any form where it is read (readContextOf)", s.Env(), form, err)
 			}
 			if holdsCanary(err.Error()) {
 				t.Errorf("%s=%q: %v, shows the value", s.Env(), form, err)
@@ -423,11 +391,8 @@ func TestNoRefusalShowsTheValueGiven(t *testing.T) {
 				}
 			}
 		}
-		switch accepts := slices.Contains(acceptsEveryForm, s.Name); {
-		case inFormat == 0 && !accepts:
-			t.Errorf("%s refused none of the forms in the one format: its parser was not reached; give it a context, or list it in acceptsEveryForm", s.Env())
-		case inFormat > 0 && accepts:
-			t.Errorf("%s refused a form in the one format, but acceptsEveryForm lists it: remove it", s.Env())
+		if inFormat == 0 && !slices.Contains(acceptsEveryForm, s.Name) {
+			t.Errorf("%s refused none of the forms in the one format: its parser was not reached; give it a context in readContextOf, or, if it takes any value, list it in acceptsEveryForm", s.Env())
 		}
 	}
 }

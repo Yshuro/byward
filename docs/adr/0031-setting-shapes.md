@@ -1,6 +1,6 @@
 # ADR-0031: Setting shapes: display and refusal
 
-- Status: Accepted
+- Status: Accepted; amended 2026-11-22 (#587)
 - Date: 2026-11-19
 - Issue: #492 (tracker #485); amends ADR-0020 §4 and §6
 
@@ -120,6 +120,15 @@ Example: the display rule from ADR-0020 §6's amendment of 2026-11-17 (#458) is 
   arguments follow, because an argument can be a token.
 
 The proxy uses both values whole.
+
+_Amended 2026-11-22 (#587):_ a shape's identity also says what kind of value a setting holds.
+`secretShape` means the value is read only from a file (`Secret`). `pathShape` means it is a path the
+proxy reads or writes, and a file there that cannot be used is named by the setting, never the path
+(`HoldsPath`, security invariant 2). `pathShape` displays and refuses as `asGivenShape` does, so
+startup and `--print-config` show paths as before. A setting has the path shape or the secret shape,
+never both; a secret's file (`<ENV>_FILE`) is still a path variable (`PathVariables`), named by its
+setting when it cannot be read. The path settings are listed literally in the shape tests, beside the
+other shapes' settings.
 
 ### 4. Where the rule is written down
 

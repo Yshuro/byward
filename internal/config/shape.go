@@ -15,6 +15,8 @@ import (
 // a refusal of a value for its form shows of it (refusedForm). display's result is one line of
 // printable characters, whatever the value holds, so a value can never start a line of its own in
 // --print-config (#505).
+// Its identity also says what kind of value the setting holds: secretShape and pathShape (ADR-0031 §3
+// as amended for #587).
 // Every registry entry has one, which init checks; build one only with newShape.
 type shape struct {
 	display func(raw string) string
@@ -31,7 +33,7 @@ func newShape(display, refused func(raw string) string) *shape {
 }
 
 // The shapes. A setting's shape is compared by identity: secretShape also means the setting is read
-// only from a file (Setting.Secret).
+// only from a file (Setting.Secret), and pathShape that it holds a path (Setting.HoldsPath).
 var (
 	// secretShape is a secret: read only from a file and never shown.
 	secretShape = newShape(func(string) string { return "<redacted>" }, notShown)
@@ -44,6 +46,11 @@ var (
 	// commandShape is a command line as a JSON array: shown by its program and how many arguments
 	// follow, since an argument can be a token (displayCommand).
 	commandShape = newShape(displayCommand, notShown)
+	// pathShape is a path the proxy reads or writes: shown as given, as asGivenShape is, since the
+	// startup listing and --print-config show paths (#575). It differs only by identity
+	// (Setting.HoldsPath): a file such a setting names that cannot be used is named by the setting and
+	// the cause, never the path (security invariant 2, #587).
+	pathShape = newShape(displayAsGiven, notShown)
 	// asGivenShape is any other value: shown as given, quoted when it holds a character that is not
 	// printable (displayAsGiven). A setting gets it by a reviewed decision
 	// (TestTheSettingsOfEachShapeAreExactlyThese).
