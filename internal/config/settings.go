@@ -137,11 +137,9 @@ func Usage() string {
 	var b strings.Builder
 	b.WriteString("Usage: byward [flags] [-- stdio-upstream-command [args...]]\n\nSettings (flag / env, default):\n")
 	for _, s := range registry {
-		flagName := "--" + s.Name
-		env := s.Env()
+		flagName, env := "--"+s.Name, s.EnvToSet()
 		if s.Secret() {
-			flagName += "-file"
-			env += "_FILE"
+			flagName = "--" + s.FileFlag()
 		}
 		fmt.Fprintf(&b, "  %s / %s", flagName, env)
 		if s.Default != "" {
@@ -169,10 +167,9 @@ func reference() string {
 			if s.Group != g {
 				continue
 			}
-			flagName, env := "--"+s.Name, s.Env()
+			flagName, env := "--"+s.Name, s.EnvToSet()
 			if s.Secret() {
-				flagName += "-file"
-				env += "_FILE"
+				flagName = "--" + s.FileFlag()
 			}
 			def := s.Default
 			if def == "" {
