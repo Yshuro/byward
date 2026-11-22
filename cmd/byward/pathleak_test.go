@@ -32,8 +32,8 @@ type pathLeakScenario struct {
 	// says are what the error line says, all on that one line: the setting at fault (with the one it
 	// pairs with, for the TLS and store files) and the cause. The first starts the error.
 	says []string
-	// env returns the settings under test, set to paths in dir that fail; a setting set to nothing is
-	// unset (#428).
+	// env returns the settings under test: breaks set to a path in dir that fails, and any companion it
+	// needs set to one beside dir that works; a setting set to nothing is unset (#428).
 	env func(t *testing.T, dir string) []string
 	// commands are the commands that refuse it; nil or empty for refusingCommands.
 	commands [][]string
@@ -42,8 +42,21 @@ type pathLeakScenario struct {
 // pathLeakScenarios are the leak test's scenarios; every path variable has at least one that breaks it
 // (TestEveryPathVariableHasALeakScenario).
 func pathLeakScenarios() []pathLeakScenario {
-	tlsPair := func(t *testing.T, dir string, b testcert.Bundle) []string {
-		cert, key := b.Write(t, dir)
+	// tlsPair writes the pair's file that breaks into the canary directory dir, and the other, which
+	// works, beside it (workingBeside): the leak test's perturbations of dir then reach only the broken
+	// half (#617).
+	tlsPair := func(t *testing.T, dir, breaks string, b testcert.Bundle) []string {
+		cert, key := workingBeside(dir, "tls.crt"), workingBeside(dir, "tls.key")
+		switch breaks {
+		case "BYWARD_TLS_CERT_FILE":
+			cert = filepath.Join(dir, "tls.crt")
+		case "BYWARD_TLS_KEY_FILE":
+			key = filepath.Join(dir, "tls.key")
+		default:
+			t.Fatalf("tlsPair: %q is neither half of the TLS pair", breaks)
+		}
+		writeFile(t, cert, string(b.Cert), 0o600)
+		writeFile(t, key, string(b.Key), 0o600)
 		return []string{"BYWARD_TLS_CERT_FILE=" + cert, "BYWARD_TLS_KEY_FILE=" + key}
 	}
 	bundle := func(t *testing.T) testcert.Bundle {
@@ -99,21 +112,21 @@ func pathLeakScenarios() []pathLeakScenario {
 			return []string{"BYWARD_ENTRA_CLIENT_SECRET_FILE=" + writeFile(t, filepath.Join(dir, "secret"), entraSecret, 0o644)}
 		}, nil},
 		{"a missing TLS certificate file", "BYWARD_TLS_CERT_FILE", []string{"BYWARD_TLS_CERT_FILE / BYWARD_TLS_KEY_FILE: the certificate file: no such file or directory"}, func(t *testing.T, dir string) []string {
-			_, key := bundle(t).Write(t, dir)
+			key := writeFile(t, workingBeside(dir, "tls.key"), string(bundle(t).Key), 0o600)
 			return []string{"BYWARD_TLS_CERT_FILE=" + filepath.Join(dir, "missing.crt"), "BYWARD_TLS_KEY_FILE=" + key}
 		}, nil},
 		{"a TLS key of another certificate", "BYWARD_TLS_KEY_FILE", []string{"BYWARD_TLS_CERT_FILE / BYWARD_TLS_KEY_FILE: the certificate and key files: tls: private key does not match public key"}, func(t *testing.T, dir string) []string {
 			good, other := bundle(t), bundle(t)
-			return tlsPair(t, dir, testcert.Bundle{Cert: good.Cert, Key: other.Key})
+			return tlsPair(t, dir, "BYWARD_TLS_KEY_FILE", testcert.Bundle{Cert: good.Cert, Key: other.Key})
 		}, nil},
 		{"an encrypted TLS key", "BYWARD_TLS_KEY_FILE", []string{"BYWARD_TLS_CERT_FILE / BYWARD_TLS_KEY_FILE: the key file: the private key is encrypted"}, func(t *testing.T, dir string) []string {
 			encrypted := []byte("-----BEGIN ENCRYPTED PRIVATE KEY-----\nAAAA\n-----END ENCRYPTED PRIVATE KEY-----\n")
-			return tlsPair(t, dir, testcert.Bundle{Cert: bundle(t).Cert, Key: encrypted})
+			return tlsPair(t, dir, "BYWARD_TLS_KEY_FILE", testcert.Bundle{Cert: bundle(t).Cert, Key: encrypted})
 		}, nil},
 		{"a TLS chain certificate that does not parse", "BYWARD_TLS_CERT_FILE", []string{"BYWARD_TLS_CERT_FILE / BYWARD_TLS_KEY_FILE: the certificate file: x509: "}, func(t *testing.T, dir string) []string {
 			b := bundle(t)
 			junk := "-----BEGIN CERTIFICATE-----\nanVuaw==\n-----END CERTIFICATE-----\n"
-			return tlsPair(t, dir, testcert.Bundle{Cert: append(b.Cert, junk...), Key: b.Key})
+			return tlsPair(t, dir, "BYWARD_TLS_CERT_FILE", testcert.Bundle{Cert: append(b.Cert, junk...), Key: b.Key})
 		}, nil},
 		// Defaults resolve inside the data directory; the first one byward opens names its own setting.
 		{"a missing data directory", "BYWARD_DATA_DIR", []string{"BYWARD_KEYS_DIR: token: key directory: no such file or directory"}, func(_ *testing.T, dir string) []string {
@@ -155,9 +168,13 @@ func TestAFileThatCannotBeUsedIsNamedByItsSettingNeverItsPath(t *testing.T) {
 			if err := os.Mkdir(dir, 0o700); err != nil {
 				t.Fatal(err)
 			}
+			companions := 0 // settings it sets beside breaks, each to a file that works
 			env := append(authEnv(t), serveEnv("https://m.example/mcp", "127.0.0.1:0")...)
 			for _, kv := range tc.env(t, dir) {
 				name, _, _ := strings.Cut(kv, "=")
+				if v := kv[len(name)+1:]; v != "" && name != tc.breaks {
+					companions++
+				}
 				env = append(without(env, name+"="), kv)
 			}
 			commands := tc.commands
@@ -182,6 +199,17 @@ func TestAFileThatCannotBeUsedIsNamedByItsSettingNeverItsPath(t *testing.T) {
 				}
 				if !said {
 					t.Errorf("%v: no line says %q; stdout %q stderr %q", args, tc.says, stdout, stderr)
+				}
+			}
+			// With a companion, the refusal is about breaks' file, not the companion's: with breaks unset, what
+			// it says goes away. Breaks' file, checked first, would otherwise hide a companion's refusal from the
+			// perturbations below (#617).
+			if companions > 0 {
+				_, stdout, stderr := runDone(commands[0], without(env, tc.breaks+"=")...)
+				for _, line := range strings.Split(stdout+stderr, "\n") {
+					if !isListing(line) && containsAll(line, tc.says) {
+						t.Errorf("%v: still says %q with %s unset: the refusal is not about its file", commands[0], tc.says, tc.breaks)
+					}
 				}
 			}
 			// The refusal is about the file: with the canary directory unsearchable, or gone, what it says goes
@@ -290,8 +318,8 @@ func TestEveryPathVariableHasALeakScenario(t *testing.T) {
 			if tc.breaks == "" {
 				t.Fatal("it declares no variable it breaks: set breaks")
 			}
-			if !strings.HasPrefix(value, dir+string(filepath.Separator)) {
-				t.Fatalf("it breaks %q but does not set it to a path in the canary directory, where the leak test looks: %q", tc.breaks, value)
+			if !inCanary(dir, value) || !strings.Contains(value, pathCanary) {
+				t.Fatalf("it breaks %q but does not set it to a path in the canary directory, spelt with it (the leak test looks for %q in what is shown): %q", tc.breaks, pathCanary, value)
 			}
 			if len(tc.says) == 0 {
 				t.Fatal("it says nothing")
@@ -304,11 +332,22 @@ func TestEveryPathVariableHasALeakScenario(t *testing.T) {
 			if !slices.Contains(named, tc.breaks) && !slices.Contains(brokenThroughDefaults, tc.breaks) {
 				t.Fatalf("it breaks %q but what it says, %q, is not about it: says must start with it as the setting at fault, before the first \": \"", tc.breaks, tc.says)
 			}
-			// Another file in the canary directory, read first, would fail under the leak test's perturbations
-			// too and could stand in for a refusal that is not about breaks' file.
+			// Every path it sets is named with the canary, so a line that shows any of them is a leak the leak
+			// test sees. Any other than breaks is a companion that works: a regular file beside dir, not in it
+			// or reached through it (workingBeside). A file in dir, or a link into it, dangling or not, would
+			// fail under the leak test's perturbations too and could stand in for a refusal that is not about
+			// breaks' file, even as the other half of a pair the line names (#617).
 			for _, kv := range env {
-				if name, v, _ := strings.Cut(kv, "="); strings.HasPrefix(v, dir+string(filepath.Separator)) && name != tc.breaks && !slices.Contains(named, name) {
-					t.Fatalf("it also sets %s to a path in the canary directory: put it outside, or name it with %s", name, tc.breaks)
+				name, v, _ := strings.Cut(kv, "=")
+				switch {
+				case v == "":
+				case !strings.Contains(v, pathCanary):
+					t.Fatalf("it sets %s to %q, not named with the canary: a line that shows it would be a leak the leak test misses", name, v)
+				case name == tc.breaks:
+				case inCanary(dir, v):
+					t.Fatalf("it also sets %s to a path in the canary directory, %q: put it beside, so that only %s's file is perturbed", name, v, tc.breaks)
+				case !regularBeside(dir, v):
+					t.Fatalf("it sets %s to %q, not a regular file directly beside the canary directory, spelt clean (workingBeside): a path through it, by a link or \"..\", would be perturbed too", name, v)
 				}
 			}
 			broken[tc.breaks] = true
@@ -319,6 +358,39 @@ func TestEveryPathVariableHasALeakScenario(t *testing.T) {
 			t.Errorf("%s holds a path but no scenario in pathLeakScenarios breaks it (set breaks: %q in one whose says starts with it)", name, name)
 		}
 	}
+}
+
+// workingBeside is the path, beside the canary directory dir, of a companion file that works: out of
+// reach of the leak test's perturbations of dir, yet named with the canary, so a line that shows its
+// path is a leak the leak test sees too.
+func workingBeside(dir, name string) string {
+	return filepath.Join(filepath.Dir(dir), pathCanary+"-"+name)
+}
+
+// regularBeside reports whether path is a regular file, not a link, directly in dir's parent and spelt
+// clean: out of reach of the leak test's perturbations of dir, which a ".." through dir would not be.
+func regularBeside(dir, path string) bool {
+	fi, err := os.Lstat(path)
+	return err == nil && fi.Mode().IsRegular() && path == filepath.Clean(path) && filepath.Dir(path) == filepath.Dir(dir)
+}
+
+// inCanary reports whether path is dir or under it: spelt under it (cleaned), or resolved into it
+// through any symlink on the way, as far as path exists. Both count, for the leak test's perturbations
+// of dir reach a path that goes through it either way.
+func inCanary(dir, path string) bool {
+	under := func(d, p string) bool { return p == d || strings.HasPrefix(p, d+string(filepath.Separator)) }
+	resolve := func(p string) string {
+		for q := p; ; q = filepath.Dir(q) { // raw first: EvalSymlinks takes ".." after a symlink as the kernel does
+			if r, err := filepath.EvalSymlinks(q); err == nil {
+				rest, _ := filepath.Rel(filepath.Clean(q), filepath.Clean(p))
+				return filepath.Join(r, rest)
+			}
+			if q == filepath.Dir(q) {
+				return filepath.Clean(p)
+			}
+		}
+	}
+	return under(filepath.Clean(dir), filepath.Clean(path)) || under(resolve(dir), resolve(path))
 }
 
 // containsAll reports whether line holds every one of parts.
@@ -360,4 +432,89 @@ func writeFile(t *testing.T, path, content string, mode os.FileMode) string {
 	}
 	chmod(t, path, mode) // WriteFile's mode passes through the umask
 	return path
+}
+
+// inCanary counts a path as in the canary directory when it is spelt under it or resolves into it,
+// and not when it only shares the directory's name as a prefix (#617).
+func TestInCanaryFindsAPathUnderTheCanaryDirectoryHoweverItIsReached(t *testing.T) {
+	parent := t.TempDir()
+	dir := filepath.Join(parent, pathCanary)
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(os.MkdirAll(filepath.Join(dir, "sub"), 0o700))
+	writeFile(t, filepath.Join(dir, "state"), "", 0o600)
+	outside := writeFile(t, filepath.Join(parent, "outside"), "", 0o600)
+	must(os.Symlink(dir, filepath.Join(parent, "to-dir")))
+	must(os.Symlink(outside, filepath.Join(dir, "to-outside")))
+	must(os.Symlink(filepath.Join(dir, "sub"), filepath.Join(parent, "to-sub")))
+	for _, tc := range []struct {
+		path string
+		want bool
+	}{
+		{dir, true},
+		{dir + "/", true},
+		{filepath.Join(dir, "missing", "deep"), true},
+		{filepath.Join(parent, "to-dir", "missing", "deep"), true}, // a missing tail through a symlink: resolved as far as it exists
+		{parent + "/./" + pathCanary + "/state", true},
+		{filepath.Join(parent, "to-dir"), true},
+		{filepath.Join(parent, "to-dir", "state"), true},
+		{filepath.Join(dir, "to-outside"), true},              // spelt under dir: perturbing dir reaches it
+		{filepath.Join(parent, "to-sub") + "/../state", true}, // ".." taken after the symlink, inside dir
+		{workingBeside(dir, "tls.key"), false},
+		{dir + "-gone", false},
+		{outside, false},
+		{"", false},
+	} {
+		if got := inCanary(dir, tc.path); got != tc.want {
+			t.Errorf("inCanary(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
+// regularBeside accepts a companion only as a regular file directly beside the canary directory,
+// spelt clean, so that the leak test's perturbations of the directory cannot reach it (#617).
+func TestRegularBesideAcceptsOnlyARegularFileDirectlyBesideTheCanaryDirectory(t *testing.T) {
+	parent := t.TempDir()
+	dir := filepath.Join(parent, pathCanary)
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(os.MkdirAll(filepath.Join(parent, "deeper"), 0o700))
+	must(os.Mkdir(dir, 0o700))
+	beside := writeFile(t, workingBeside(dir, "tls.key"), "", 0o600)
+	inside := writeFile(t, filepath.Join(dir, "state"), "", 0o600)
+	writeFile(t, filepath.Join(parent, "deeper", pathCanary+"-x"), "", 0o600)
+	must(os.Symlink(inside, workingBeside(dir, "link")))
+	must(os.Symlink(filepath.Join(dir, "gone"), workingBeside(dir, "dangling")))
+	must(os.Symlink(beside, workingBeside(dir, "to-beside")))
+	must(os.Symlink(dir, filepath.Join(parent, "to-dir")))
+	must(os.Mkdir(workingBeside(dir, "dir"), 0o700))
+	for _, tc := range []struct {
+		name string
+		path string
+		want bool
+	}{
+		{"a regular file beside", beside, true},
+		{"the same, spelt with ./", parent + "/./" + pathCanary + "-tls.key", false},
+		{"the same, spelt through the directory with ..", dir + "/../" + pathCanary + "-tls.key", false},
+		{"the same, spelt through a link to the directory with ..", filepath.Join(parent, "to-dir") + "/../" + pathCanary + "-tls.key", false},
+		{"a link beside into the directory", workingBeside(dir, "link"), false},
+		{"a dangling link beside into the directory", workingBeside(dir, "dangling"), false},
+		{"a link beside to the file beside", workingBeside(dir, "to-beside"), false},
+		{"a directory beside", workingBeside(dir, "dir"), false},
+		{"a file in the directory", inside, false},
+		{"a file one level deeper", filepath.Join(parent, "deeper", pathCanary+"-x"), false},
+		{"a missing path beside", workingBeside(dir, "missing"), false},
+	} {
+		if got := regularBeside(dir, tc.path); got != tc.want {
+			t.Errorf("%s: regularBeside(%q) = %v, want %v", tc.name, tc.path, got, tc.want)
+		}
+	}
 }
