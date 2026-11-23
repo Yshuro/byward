@@ -81,6 +81,17 @@ func HasEmptyLabel(name string) bool {
 	return strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".") || strings.Contains(name, "..")
 }
 
+// HasEdgeHyphen reports whether any dot-separated label of name starts or ends with a hyphen.
+// RFC 952 and RFC 1123 §2.1 require each label to start and end with an alphanumeric character.
+func HasEdgeHyphen(name string) bool {
+	for label := range strings.SplitSeq(name, ".") {
+		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return true
+		}
+	}
+	return false
+}
+
 // Parse reads hostport (host, host:port, [IPv6], [IPv6]:port, or a bare IPv6 address taken whole)
 // as the WHATWG URL host parser does for scheme: a name is folded to its ASCII lower case (IDNA,
 // as browsers map it), a host that ends in a number is read as an IPv4 address (127.1 is 127.0.0.1)

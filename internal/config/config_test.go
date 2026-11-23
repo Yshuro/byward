@@ -139,7 +139,7 @@ const (
 	wantDenylist      = `BYWARD_CLIENT_DENYLIST: want a CIMD client ID (an https URL) or a host name such as app.example; got entry 1 of 1 `
 	wantTrusted       = `BYWARD_CIMD_TRUSTED_HOSTS: want a host name such as claude.ai; got entry 1 of 1 `
 	wantAllowed       = `BYWARD_CIMD_ALLOWED_HOSTS: want a host name such as claude.ai; got entry 1 of 1 `
-	ruleHostName      = `a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)`
+	ruleHostName      = `a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)`
 	rulePort          = `has a port that is not a number from 1 to 65535 without a sign or leading zero`
 	ruleForms         = `give host, host:port, an IPv6 address, [IPv6] or [IPv6]:port, with a port from 1 to 65535 and no IPv6 zone`
 	ruleNotASCII      = `holds a character that is not ASCII; give an internationalized host in its ASCII (xn--) form, which browsers and MCP clients send`
@@ -174,6 +174,10 @@ func TestAURLOrHostRefusedForItsFormSaysWhereAndWhyNeverWhat(t *testing.T) {
 		// place is named, never the character.
 		{"public host with a wildcard", "BYWARD_PUBLIC_URL=https://a*b/mcp", wantPublicURL + `(15 characters, not shown): its host ` + ruleNameChar + `2` + ruleNameChars},
 		{"public host with a tilde", "BYWARD_PUBLIC_URL=https://s3cret~tok.example/mcp", wantPublicURL + `(30 characters, not shown): its host ` + ruleNameChar + `7` + ruleNameChars},
+		{"public host made only of a hyphen", "BYWARD_PUBLIC_URL=https://-/mcp", wantPublicURL + `(13 characters, not shown): its host:port breaks the host name rule: ` + ruleHostName},
+		{"public host with leading hyphen", "BYWARD_PUBLIC_URL=https://-a.example/mcp", wantPublicURL + `(22 characters, not shown): its host:port breaks the host name rule: ` + ruleHostName},
+		{"public host with trailing hyphen", "BYWARD_PUBLIC_URL=https://a-.example/mcp", wantPublicURL + `(22 characters, not shown): its host:port breaks the host name rule: ` + ruleHostName},
+		{"public host with inner label leading hyphen", "BYWARD_PUBLIC_URL=https://a.-b.example/mcp", wantPublicURL + `(24 characters, not shown): its host:port breaks the host name rule: ` + ruleHostName},
 		// The upstream's host too, which url.Parse and Go's dialer would take (ADR-0032 §3, D4).
 		{"upstream host with a tilde", "BYWARD_UPSTREAM_URL=http://s3cret~tok:8000/mcp", wantUpstreamURL + `(26 characters, not shown): its host ` + ruleNameChar + `7` + ruleNameChars + orUpstreamCommand},
 		{"upstream host with a dollar sign", "BYWARD_UPSTREAM_URL=http://my$mcp:8000/mcp", wantUpstreamURL + `(22 characters, not shown): its host ` + ruleNameChar + `3` + ruleNameChars + orUpstreamCommand},
@@ -1069,7 +1073,7 @@ func TestAnAllowedHostNameRefusesEveryCharacterAHostNameCannotHave(t *testing.T)
 // each on its own, stored in lower case except in the denylist, which keeps entries as given. The
 // public URL refuses upper case (#472), so it loads only the lower-case names, each as its issuer.
 func TestHostSettingsLoadUnderscoresIDNANamesAndMixedCase(t *testing.T) {
-	for _, host := range []string{"my_svc.example", "xn--bcher-kva.example", "Mixed-Case.Example"} {
+	for _, host := range []string{"my_svc.example", "xn--bcher-kva.example", "Mixed-Case.Example", "a-b.example"} {
 		lower := strings.ToLower(host)
 		settings := map[string]func(*Config) []string{
 			"BYWARD_CIMD_TRUSTED_HOSTS=" + host: func(c *Config) []string { return c.CIMDTrustedHosts },
@@ -1092,6 +1096,48 @@ func TestHostSettingsLoadUnderscoresIDNANamesAndMixedCase(t *testing.T) {
 				}
 				if got := stored(c); !slices.Equal(got, []string{want}) {
 					t.Errorf("stored %v, want [%s]", got, want)
+				}
+			})
+		}
+	}
+}
+
+// #630: a host name refuses labels with leading or trailing hyphens across all host settings
+// (BYWARD_PUBLIC_URL, BYWARD_ALLOWED_HOSTS, BYWARD_ALLOWED_ORIGINS, BYWARD_CIMD_TRUSTED_HOSTS,
+// BYWARD_CIMD_ALLOWED_HOSTS, BYWARD_CLIENT_DENYLIST, BYWARD_LISTEN, and BYWARD_INTERNAL_LISTEN).
+func TestHostNameRuleRefusesLabelsWithLeadingOrTrailingHyphen(t *testing.T) {
+	refused := []string{"-", "-a.example", "a-.example", "a.-b.example", "a.b-"}
+	for _, host := range refused {
+		t.Run("validHostName/"+host, func(t *testing.T) {
+			if validHostName(host) {
+				t.Errorf("validHostName(%q) = true, want false", host)
+			}
+		})
+	}
+	accepted := []string{"a-b.example", "xn--bcher-kva.example"}
+	for _, host := range accepted {
+		t.Run("validHostName/"+host, func(t *testing.T) {
+			if !validHostName(host) {
+				t.Errorf("validHostName(%q) = false, want true", host)
+			}
+		})
+	}
+
+	settings := []struct{ setting, format, want string }{
+		{"public URL", "BYWARD_PUBLIC_URL=https://%s/mcp", "breaks the host name rule: " + ruleHostName},
+		{"allowed hosts", "BYWARD_ALLOWED_HOSTS=%s", "breaks the host name rule: " + ruleHostName},
+		{"allowed origins", "BYWARD_ALLOWED_ORIGINS=https://%s", "breaks the host name rule: " + ruleHostName},
+		{"CIMD trusted hosts", "BYWARD_CIMD_TRUSTED_HOSTS=%s", "breaks the host name rule: " + ruleHostName},
+		{"CIMD allowed hosts", "BYWARD_CIMD_ALLOWED_HOSTS=%s", "breaks the host name rule: " + ruleHostName},
+		{"client denylist", "BYWARD_CLIENT_DENYLIST=%s", "breaks the host name rule: " + ruleHostName},
+		{"listen", "BYWARD_LISTEN=%s:8080", "has a host that is neither an IP address nor a host name"},
+		{"internal listen", "BYWARD_INTERNAL_LISTEN=%s:8081", "has a host that is neither an IP address nor a host name"},
+	}
+	for _, host := range refused {
+		for _, tc := range settings {
+			t.Run("settings/"+tc.setting+"/"+host, func(t *testing.T) {
+				if _, err := load(t, nil, fmt.Sprintf(tc.format, host)); err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Errorf(tc.format+" err = %v, want %q", host, err, tc.want)
 				}
 			})
 		}
