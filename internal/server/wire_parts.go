@@ -46,6 +46,9 @@ type authParts struct {
 // empty for warnings that come from a package with its own wording (the access gate's).
 type Warning struct {
 	Message string
+	// Setting is the setting at fault, or empty. A certificate, the serving certificate or the Entra
+	// client certificate, is named as the operator gave it, by its flag too, in the log as well (#619);
+	// other settings are named by their variable (#623).
 	Setting string
 	Fix     string
 }
@@ -111,7 +114,7 @@ func loadAuthParts(cfg *config.Config, idpHTTP *http.Client) (*authParts, error)
 	ring, err := token.LoadKeyRing(cfg.KeysDir, secretCheck(cfg))
 	if err != nil {
 		// No key generation (ADR-0007 §5): the operator creates the first key.
-		return nil, fmt.Errorf("BYWARD_KEYS_DIR: %w (see docs/how-to/sealing-keys.md)", err)
+		return nil, fmt.Errorf("%s: %w (see docs/how-to/sealing-keys.md)", cfg.Values.NameAsGiven("keys-dir"), err)
 	}
 	p := &authParts{ring: ring}
 	if p.sealer, err = token.NewSealer(ring, cfg.PublicURL.String()); err != nil {
@@ -139,7 +142,7 @@ func loadAuthParts(cfg *config.Config, idpHTTP *http.Client) (*authParts, error)
 	}
 	p.static, err = registration.LoadStatic(cfg.StaticClientsFile, os.ReadFile, p.jti, opts...)
 	if err != nil {
-		loose = append(loose, fmt.Errorf("BYWARD_STATIC_CLIENTS_FILE: %w (see docs/reference/static-clients.md)", err))
+		loose = append(loose, fmt.Errorf("%s: %w (see docs/reference/static-clients.md)", cfg.Values.NameAsGiven("static-clients-file"), err))
 	}
 	if err := errors.Join(loose...); err != nil {
 		return nil, err
@@ -217,16 +220,16 @@ func looseSecretFiles(cfg *config.Config) []error {
 	}
 	if f := cfg.TLSKeyFile; f != "" {
 		if err := check(f); err != nil {
-			loose = append(loose, fmt.Errorf("%s: %w", tlsKeyEnv, logging.FileError(err)))
+			loose = append(loose, fmt.Errorf("%s: %w", cfg.Values.NameAsGiven("tls-key-file"), logging.FileError(err)))
 		}
 	}
 	// A federated token is a credential too, though it is read at each request, not at start.
 	if f := cfg.EntraFederatedTokenFile; f != "" {
 		// It must exist even in --dev, as every other secret file must to be read at start.
 		if _, err := os.Stat(f); err != nil {
-			loose = append(loose, fmt.Errorf("%s: %w", config.Setting{Name: "entra-federated-token-file"}.Env(), logging.FileError(err)))
+			loose = append(loose, fmt.Errorf("%s: %w", cfg.Values.NameAsGiven("entra-federated-token-file"), logging.FileError(err)))
 		} else if err := check(f); err != nil {
-			loose = append(loose, fmt.Errorf("%s: %w", config.Setting{Name: "entra-federated-token-file"}.Env(), logging.FileError(err)))
+			loose = append(loose, fmt.Errorf("%s: %w", cfg.Values.NameAsGiven("entra-federated-token-file"), logging.FileError(err)))
 		}
 	}
 	return loose
