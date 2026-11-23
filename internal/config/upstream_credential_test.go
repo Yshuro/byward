@@ -202,7 +202,10 @@ func TestTheUpstreamCredentialIsRefusedForAStdioUpstreamNamingTheSettingAsGiven(
 func TestAnUpstreamCredentialOfTheLimitIsTaken(t *testing.T) {
 	cred := strings.Repeat("k", maxUpstreamCredential)
 	c, err := loadCred(t, nil, cred, "BYWARD_UPSTREAM_CREDENTIAL_FILE="+credFile, "BYWARD_UPSTREAM_CREDENTIAL_HEADER=X-Api-Key")
-	if err != nil || c.UpstreamCredential != cred {
-		t.Fatalf("err = %v, want the credential of %d bytes taken", err, maxUpstreamCredential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.UpstreamCredential != cred {
+		t.Fatalf("want the credential of %d bytes taken", maxUpstreamCredential)
 	}
 }

@@ -46,8 +46,12 @@ func TestBooleanSettingsAreExactlyTheBoolFlags(t *testing.T) {
 			if err != nil {
 				t.Fatalf("a bare --%s is refused: %v", s.Name, err)
 			}
-			if b, err := v.boolean(s.Name); err != nil || !b {
-				t.Fatalf("a bare --%s reads as %v (err %v), want true", s.Name, b, err)
+			b, err := v.boolean(s.Name)
+			if err != nil {
+				t.Fatalf("a bare --%s error: %v", s.Name, err)
+			}
+			if !b {
+				t.Fatalf("a bare --%s reads as false, want true", s.Name)
 			}
 		})
 	}

@@ -408,8 +408,11 @@ func TestPositionalArgumentIsAConfigError(t *testing.T) {
 
 func TestVersionNeedsNoOtherSettings(t *testing.T) {
 	_, act, err := Load([]string{"--version", "--json"}, nil, nil)
-	if err != nil || !act.Version || !act.JSON {
-		t.Fatalf("act=%+v err=%v", act, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !act.Version || !act.JSON {
+		t.Fatalf("act=%+v, want Version and JSON", act)
 	}
 }
 
@@ -438,8 +441,11 @@ func TestSecretFromEnvFile(t *testing.T) {
 
 func TestSecretFromFlagFileBeatsEnvFile(t *testing.T) {
 	v, err := resolve(secretReg, []string{"--client-secret-file", "/a"}, []string{"BYWARD_CLIENT_SECRET_FILE=/b"}, files(map[string]string{"/a": "A", "/b": "B"}), nil)
-	if err != nil || v.byKey["client-secret"].Given.raw() != "A" {
-		t.Fatalf("got %q err=%v", v.byKey["client-secret"].Given.raw(), err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := v.byKey["client-secret"].Given.raw(); got != "A" {
+		t.Fatalf("got %q, want A", got)
 	}
 }
 
@@ -479,8 +485,11 @@ func TestInlineSecretRejectedOutsideDevMode(t *testing.T) {
 		t.Fatalf("without dev: want error pointing at the _FILE variable, got %v", err)
 	}
 	relaxed, err := checkInlineSecrets(v, true)
-	if err != nil || !strings.Contains(relaxed, "BYWARD_CLIENT_SECRET") {
-		t.Fatalf("with dev: relaxation=%q err=%v", relaxed, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(relaxed, "BYWARD_CLIENT_SECRET") {
+		t.Fatalf("with dev: relaxation=%q", relaxed)
 	}
 }
 
@@ -537,8 +546,11 @@ func TestBrokerSettingsAreRequired(t *testing.T) {
 		t.Errorf("secret: %v", err)
 	}
 	c, err := load(t, nil)
-	if err != nil || c.EntraClientSecret != "s3cret-entra" || c.KeysDir == "" {
-		t.Fatalf("c=%+v err=%v", c, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.EntraClientSecret != "s3cret-entra" || c.KeysDir == "" {
+		t.Fatalf("c=%+v, want EntraClientSecret and KeysDir", c)
 	}
 }
 
@@ -628,8 +640,11 @@ func TestOAuthRateLimitsDefaultToADR0018AndCanBeRaisedWithinBounds(t *testing.T)
 		}
 	}
 	cfg, _, err = Load(nil, noAuthEnv("BYWARD_OAUTH_RATE_LIMITS=authorize=1, token=10000"), nil) // both bounds
-	if err != nil || cfg.OAuthRateLimits["authorize"] != 1 || cfg.OAuthRateLimits["token"] != 10000 {
-		t.Fatalf("the bounds: %v, %v; want both accepted", cfg.OAuthRateLimits, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OAuthRateLimits["authorize"] != 1 || cfg.OAuthRateLimits["token"] != 10000 {
+		t.Fatalf("the bounds: %v; want both accepted", cfg.OAuthRateLimits)
 	}
 	cfg, _, err = Load(nil, noAuthEnv("BYWARD_OAUTH_RATE_LIMITS=authorize=120, token=600"), nil)
 	if err != nil {
@@ -764,8 +779,12 @@ func TestTrustedProxiesTakeCIDRsAndAddresses(t *testing.T) {
 			}
 		})
 	}
-	if cfg, _, err := Load(nil, noAuthEnv(), nil); err != nil || len(cfg.TrustedProxies) != 0 {
-		t.Errorf("default trusted proxies = %v (err %v), want none", cfg.TrustedProxies, err)
+	cfg, _, err = Load(nil, noAuthEnv(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TrustedProxies) != 0 {
+		t.Errorf("default trusted proxies = %v, want none", cfg.TrustedProxies)
 	}
 	const refused = "BYWARD_TRUSTED_PROXIES: want a CIDR or an IP address such as 10.0.0.0/8 or 192.0.2.1; got entry 1 of 1"
 	for _, tc := range []struct{ name, value, want string }{
@@ -898,8 +917,11 @@ func TestTheConfigSaysWhetherTheStaticClientsFileWasNamed(t *testing.T) {
 		named bool
 	}{{nil, false}, {[]string{"BYWARD_STATIC_CLIENTS_FILE=/etc/byward/clients.json"}, true}} {
 		c, err := load(t, nil, tc.env...)
-		if err != nil || c.StaticClientsFileNamed != tc.named {
-			t.Fatalf("env %q: named = %v (%v), want %v", tc.env, c.StaticClientsFileNamed, err, tc.named)
+		if err != nil {
+			t.Fatalf("env %q: %v", tc.env, err)
+		}
+		if c.StaticClientsFileNamed != tc.named {
+			t.Fatalf("env %q: named = %v, want %v", tc.env, c.StaticClientsFileNamed, tc.named)
 		}
 	}
 }
@@ -966,8 +988,12 @@ func TestCIMDHostListsAreNormalizedAndRefusedWhileCIMDIsOff(t *testing.T) {
 	if !c.CIMD || !slices.Equal(c.CIMDTrustedHosts, []string{"claude.ai", "vscode.dev"}) || !slices.Equal(c.CIMDAllowedHosts, []string{"apps.example.com"}) {
 		t.Fatalf("CIMD %v, trusted %v, allowed %v", c.CIMD, c.CIMDTrustedHosts, c.CIMDAllowedHosts)
 	}
-	if c, err = load(t, nil, "BYWARD_CIMD=false"); err != nil || c.CIMD {
-		t.Fatalf("CIMD off: %v, %v", c.CIMD, err)
+	c, err = load(t, nil, "BYWARD_CIMD=false")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.CIMD {
+		t.Fatalf("CIMD off: %v", c.CIMD)
 	}
 	// Host lists with CIMD off would silently do nothing.
 	if _, err := load(t, nil, "BYWARD_CIMD=false", "BYWARD_CIMD_TRUSTED_HOSTS=claude.ai"); !isConfigError(err) || !strings.Contains(err.Error(), "no effect while BYWARD_CIMD is false") {
@@ -1205,8 +1231,11 @@ func TestTheIssuerIsShownThroughItsShapeOrAsThePresetsOwn(t *testing.T) {
 // that can carry a credential; any other is left to client registration, which refuses it at wiring.
 func TestADenylistEntryThatDoesNotParseWithoutAnAtIsLoadedAsGivenForRegistration(t *testing.T) {
 	c, err := load(t, nil, "BYWARD_CLIENT_DENYLIST=https://a%zz.example/x")
-	if err != nil || !slices.Equal(c.ClientDenylist, []string{"https://a%zz.example/x"}) {
-		t.Fatalf("got %v, %v; want it loaded as given", c, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(c.ClientDenylist, []string{"https://a%zz.example/x"}) {
+		t.Fatalf("got %v, want it loaded as given", c)
 	}
 }
 

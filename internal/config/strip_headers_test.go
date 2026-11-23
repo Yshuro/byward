@@ -9,8 +9,11 @@ import (
 // compares; nothing is stripped by default.
 func TestTheUpstreamStripListIsReadAsCanonicalHeaderNames(t *testing.T) {
 	c, err := load(t, nil)
-	if err != nil || len(c.UpstreamStripHeaders) != 0 {
-		t.Fatalf("default %q (%v), want none", c.UpstreamStripHeaders, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.UpstreamStripHeaders) != 0 {
+		t.Fatalf("default %q, want none", c.UpstreamStripHeaders)
 	}
 	c, err = load(t, nil, "BYWARD_UPSTREAM_STRIP_HEADERS= x-argocd-base-url, TFE_TOKEN ,,opensearch-url,mcp-params,x-tenant-param-id")
 	if err != nil {

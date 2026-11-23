@@ -9,13 +9,19 @@ import (
 // App-only tokens are off unless turned on, and on they carry the app gate.
 func TestAppOnlyTokensAreOffByDefaultAndReadTheirGateWhenOn(t *testing.T) {
 	c, err := load(t, nil)
-	if err != nil || c.AppTokens != "off" || c.AppRoles != nil {
-		t.Fatalf("default: %q %v, %v", c.AppTokens, c.AppRoles, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AppTokens != "off" || c.AppRoles != nil {
+		t.Fatalf("default: %q %v", c.AppTokens, c.AppRoles)
 	}
 	c, err = load(t, nil, "BYWARD_APP_TOKENS=entra", "BYWARD_APP_ROLES=MCP.Invoke, MCP.Admin", "BYWARD_APP_CLIENT_IDS=00000000-0000-0000-0000-00000000000a")
-	if err != nil || c.AppTokens != "entra" || !slices.Equal(c.AppRoles, []string{"MCP.Invoke", "MCP.Admin"}) ||
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AppTokens != "entra" || !slices.Equal(c.AppRoles, []string{"MCP.Invoke", "MCP.Admin"}) ||
 		!slices.Equal(c.AppClientIDs, []string{"00000000-0000-0000-0000-00000000000a"}) {
-		t.Fatalf("on: %+v, %v", c, err)
+		t.Fatalf("on: %+v", c)
 	}
 }
 

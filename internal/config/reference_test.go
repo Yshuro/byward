@@ -16,7 +16,10 @@ func TestReferenceIsCurrent(t *testing.T) {
 		}
 	}
 	got, err := os.ReadFile(referencePath)
-	if err != nil || string(got) != want {
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
 		t.Fatalf("%s is stale; run BYWARD_UPDATE_REFERENCE=1 go test ./internal/config/", referencePath)
 	}
 }
