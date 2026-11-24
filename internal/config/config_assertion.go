@@ -16,11 +16,14 @@ func (c *Config) assertion(v *Values) []error {
 	if c.AssertionHeader, err = parseHeaderName(v.value("assertion-header")); err != nil {
 		errs = append(errs, err)
 	}
-	ihEnv := Setting{Name: "identity-headers"}.Env()
+	// Beside a stdio upstream the setting is refused for any value given, false too (#606), as every
+	// setting given for a family that is off is (#596); a variable set to nothing is unset (#428). The
+	// value is still read, so a malformed one is named too, as for the sibling settings.
+	if v.stdioUpstream() && v.byKey["identity-headers"].Source != SourceDefault {
+		errs = append(errs, errorf("%s is for an HTTP upstream; a stdio upstream gets the user in its environment (BYWARD_SUBJECT, docs/how-to/stdio-upstream.md)", spelled(v.byKey["identity-headers"])))
+	}
 	if c.IdentityHeaders, err = v.boolean("identity-headers"); err != nil {
 		errs = append(errs, err)
-	} else if c.IdentityHeaders && v.stdioUpstream() {
-		errs = append(errs, errorf("%s is for an HTTP upstream; a stdio upstream gets the user in its environment (BYWARD_SUBJECT, docs/how-to/stdio-upstream.md)", ihEnv))
 	}
 	if c.AssertionUnverifiedEmail, err = v.boolean("assertion-unverified-email"); err != nil {
 		errs = append(errs, err)
