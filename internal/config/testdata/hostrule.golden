@@ -25,9 +25,9 @@ mcp.example.com.
   public http: refused: BYWARD_PUBLIC_URL: want the MCP endpoint's URL such as https://mcp.example.com/mcp; got a value (27 characters, not shown): its host name has an empty label (a leading, double or trailing dot); drop the extra dot
   upstream: mcp.example.com.
   listen: mcp.example.com.:80
-  allowed host: refused: it breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)
-  origin: refused: its host:port breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)
-  cimd list: "breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)"
+  allowed host: refused: it breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)
+  origin: refused: its host:port breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)
+  cimd list: "breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)"
   denylist: ""
   host header: mcp.example.com.
   loopback as written: false
@@ -170,8 +170,8 @@ mcp.10
   listen: [::1]:80
   allowed host: [::1], hostname ::1, loopback true
   origin: https://[::1]
-  cimd list: "breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)"
-  denylist: "breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)"
+  cimd list: "breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)"
+  denylist: "breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)"
   host header: [::1]
   loopback as written: true
 [0:0::1]
@@ -181,8 +181,8 @@ mcp.10
   listen: [0:0::1]:80
   allowed host: [::1], hostname ::1, loopback true
   origin: https://[::1]
-  cimd list: "breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)"
-  denylist: "breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)"
+  cimd list: "breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)"
+  denylist: "breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)"
   host header: [::1]
   loopback as written: true
 [2001:DB8::1]
@@ -192,8 +192,8 @@ mcp.10
   listen: [2001:DB8::1]:80
   allowed host: [2001:db8::1], hostname 2001:db8::1, loopback false
   origin: https://[2001:db8::1]
-  cimd list: "breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)"
-  denylist: "breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)"
+  cimd list: "breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)"
+  denylist: "breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)"
   host header: [2001:db8::1]
   loopback as written: false
 [::ffff:127.0.0.1]
@@ -203,8 +203,8 @@ mcp.10
   listen: [::ffff:127.0.0.1]:80
   allowed host: [::ffff:7f00:1], hostname ::ffff:7f00:1, loopback true
   origin: https://[::ffff:7f00:1]
-  cimd list: "breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)"
-  denylist: "breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)"
+  cimd list: "breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)"
+  denylist: "breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)"
   host header: [::ffff:7f00:1]
   loopback as written: true
 [fe80::1%25eth0]
@@ -214,8 +214,8 @@ mcp.10
   listen: [fe80::1%25eth0]:80
   allowed host: refused: it is not an IPv6 address without a zone; give host, host:port, an IPv6 address, [IPv6] or [IPv6]:port, with a port from 1 to 65535 and no IPv6 zone
   origin: refused: its host:port is not an IPv6 address without a zone; give host, host:port, an IPv6 address, [IPv6] or [IPv6]:port, with a port from 1 to 65535 and no IPv6 zone
-  cimd list: "breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)"
-  denylist: "breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)"
+  cimd list: "breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)"
+  denylist: "breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)"
   host header: [fe80::1%25eth0]
   loopback as written: false
 xn--bcher-kva.example
@@ -289,10 +289,10 @@ a..b
   public http: refused: BYWARD_PUBLIC_URL: want the MCP endpoint's URL such as https://mcp.example.com/mcp; got a value (15 characters, not shown): its host name has an empty label (a leading, double or trailing dot); drop the extra dot
   upstream: a..b
   listen: refused: BYWARD_LISTEN: want host:port such as 127.0.0.1:8080; got a value (7 characters, not shown): it has a host that is neither an IP address nor a host name
-  allowed host: refused: it breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)
-  origin: refused: its host:port breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)
-  cimd list: "breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)"
-  denylist: "breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)"
+  allowed host: refused: it breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)
+  origin: refused: its host:port breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)
+  cimd list: "breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)"
+  denylist: "breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)"
   host header: a..b
   loopback as written: false
 mcp.example.com:443
@@ -302,8 +302,8 @@ mcp.example.com:443
   listen: mcp.example.com:443
   allowed host: mcp.example.com:443, hostname mcp.example.com, loopback false
   origin: https://mcp.example.com
-  cimd list: "breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)"
-  denylist: "breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)"
+  cimd list: "breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)"
+  denylist: "breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)"
   host header: mcp.example.com:443
   loopback as written: false
 mcp.example.com:8443
@@ -313,8 +313,8 @@ mcp.example.com:8443
   listen: mcp.example.com:8443
   allowed host: mcp.example.com:8443, hostname mcp.example.com, loopback false
   origin: https://mcp.example.com:8443
-  cimd list: "breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)"
-  denylist: "breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)"
+  cimd list: "breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)"
+  denylist: "breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)"
   host header: mcp.example.com:8443
   loopback as written: false
 [::1]:8080
@@ -324,8 +324,8 @@ mcp.example.com:8443
   listen: [::1]:8080
   allowed host: [::1]:8080, hostname ::1, loopback true
   origin: https://[::1]:8080
-  cimd list: "breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)"
-  denylist: "breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)"
+  cimd list: "breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)"
+  denylist: "breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)"
   host header: [::1]:8080
   loopback as written: true
 localhost:80
@@ -335,7 +335,7 @@ localhost:80
   listen: localhost:80
   allowed host: localhost:80, hostname localhost, loopback true
   origin: https://localhost:80
-  cimd list: "breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)"
-  denylist: "breaks the host name rule: a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)"
+  cimd list: "breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)"
+  denylist: "breaks the host name rule: a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)"
   host header: localhost:80
   loopback as written: true

@@ -528,7 +528,7 @@ func parseListen(val Value, want string) (string, error) {
 }
 
 // hostNameRule is what validHostName requires, for the errors of the settings that use it.
-const hostNameRule = "a host name has only letters, digits and - . _ ~, and no empty label (no leading or double dot; drop a trailing one)"
+const hostNameRule = "a host name has only letters, digits and - . _ ~, no label starts or ends with a hyphen, and no empty label (no leading or double dot; drop a trailing one)"
 
 // validHostName reports whether host is a name a host setting can match on: BYWARD_ALLOWED_HOSTS
 // (#334), BYWARD_PUBLIC_URL's host, BYWARD_CIMD_TRUSTED_HOSTS, BYWARD_CIMD_ALLOWED_HOSTS (#344),
@@ -542,5 +542,5 @@ const hostNameRule = "a host name has only letters, digits and - . _ ~, and no e
 func validHostName(name string) bool {
 	// "~" is ADR-0032 §3's host name characters' one extra here, which classes B and S keep until
 	// slices 3 and 4 (#523, #524); the public URL and the operator addresses refuse it first.
-	return name != "" && strings.Trim(name, host.NameChars+"~") == "" && !host.HasEmptyLabel(name)
+	return name != "" && strings.Trim(name, host.NameChars+"~") == "" && !host.HasEmptyLabel(name) && !host.HasEdgeHyphen(name)
 }

@@ -196,3 +196,15 @@ func TestHasEmptyLabelIsALeadingDoubleOrTrailingDot(t *testing.T) {
 		}
 	}
 }
+
+// A host name's labels never start or end with a hyphen (RFC 952, RFC 1123 §2.1).
+func TestHasEdgeHyphenIsALeadingOrTrailingHyphenInAnyLabel(t *testing.T) {
+	for name, want := range map[string]bool{
+		"-": true, "-a.example": true, "a-.example": true, "a.-b.example": true, "a.b-": true,
+		"a-b.example": false, "xn--bcher-kva.example": false, "a": false, "": false,
+	} {
+		if got := HasEdgeHyphen(name); got != want {
+			t.Errorf("HasEdgeHyphen(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
