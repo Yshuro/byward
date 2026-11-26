@@ -149,6 +149,7 @@ const (
 	ruleNameChar      = "has a character no host name holds at position "
 	ruleEmptyLabel    = `its host name has an empty label (a leading, double or trailing dot); drop the extra dot`
 	ruleNameChars     = `; a host name has only letters, digits, - . and _`
+	ruleZone          = `has an IPv6 zone that is not an interface name: 1 to 15 bytes, not . or .., without white space, a control character, a slash or a colon`
 )
 
 func TestAURLOrHostRefusedForItsFormSaysWhereAndWhyNeverWhat(t *testing.T) {
@@ -217,8 +218,10 @@ func TestAURLOrHostRefusedForItsFormSaysWhereAndWhyNeverWhat(t *testing.T) {
 		{"unicode allowed host", "BYWARD_ALLOWED_HOSTS=bücher.example:8443", wantHosts + `(19 characters, not shown): it ` + ruleNotASCII},
 		{"host with path", "BYWARD_ALLOWED_HOSTS=a.example/x", wantHosts + `(11 characters, not shown): it holds a "/" or a space; ` + ruleForms},
 		{"host with space", "BYWARD_ALLOWED_HOSTS=a b", wantHosts + `(3 characters, not shown): it holds a "/" or a space; ` + ruleForms},
-		{"bracketed host name", "BYWARD_ALLOWED_HOSTS=[mcp.internal.example]", wantHosts + `(22 characters, not shown): it is not an IPv6 address without a zone; ` + ruleForms},
-		{"bracketed IPv4 with a port", "BYWARD_ALLOWED_HOSTS=[127.0.0.1]:8443", wantHosts + `(16 characters, not shown): it is not an IPv6 address without a zone; ` + ruleForms},
+		{"bracketed host name", "BYWARD_ALLOWED_HOSTS=[mcp.internal.example]", wantHosts + `(22 characters, not shown): it has brackets that do not enclose an IPv6 address alone; ` + ruleForms},
+		{"bracketed IPv4 with a port", "BYWARD_ALLOWED_HOSTS=[127.0.0.1]:8443", wantHosts + `(16 characters, not shown): it has brackets that do not enclose an IPv6 address alone; ` + ruleForms},
+		// One ':' inside passes the brackets, as host.Parse's rule does; the host is then no IPv6 address.
+		{"one colon in brackets", "BYWARD_ALLOWED_HOSTS=[a:b]:8443", wantHosts + `(10 characters, not shown): it is not an IPv6 address without a zone; ` + ruleForms},
 		{"IPv6 with a zone", "BYWARD_ALLOWED_HOSTS=[fe80::1%eth0]:8443", wantHosts + `(19 characters, not shown): it is not an IPv6 address without a zone; ` + ruleForms},
 		{"unclosed bracket", "BYWARD_ALLOWED_HOSTS=[::1", wantHosts + `(4 characters, not shown): it has brackets that do not enclose an IPv6 address alone; ` + ruleForms},
 		{"name with a closing bracket", "BYWARD_ALLOWED_HOSTS=mcp.example]", wantHosts + `(12 characters, not shown): it has brackets that do not enclose an IPv6 address alone; ` + ruleForms},
@@ -1185,7 +1188,8 @@ func TestDevelopmentModeChangesOnlyWhatItRecords(t *testing.T) {
 func length(s string) int { return len([]rune(s)) }
 
 // #494: a listen address is host:port, as net.Listen takes it: the host empty, an IP address (a zoned
-// IPv6 one included, its zone any interface name) or a host name of letters, digits, - . and _ only
+// IPv6 one included, its zone a name an interface can have or an interface index, #638) or a host
+// name of letters, digits, - . and _ only
 // (ADR-0032 §3) with one trailing dot at most, and the port a number from 0 to
 // 65535; a service name such as http is refused. Brackets enclose an IPv6 address alone (#629): around
 // a name, an IPv4 address or nothing they are refused, though net.SplitHostPort would strip them. A
@@ -1194,10 +1198,13 @@ func length(s string) int { return len([]rune(s)) }
 func TestAListenAddressIsHostColonANumericPortAndARefusedOneIsNeverShown(t *testing.T) {
 	for _, ok := range []string{"127.0.0.1:8080", ":8080", "[::1]:8080", "localhost:0", "0.0.0.0:65535", "byward.internal:8443",
 		"[fe80::1%lo0]:8080", "[fe80::1%ü]:8080", "byward.internal.:8443", "127.0.0.1:000080", "my_byward:8080",
-		"[fe80::1%eth0]:80", "[::ffff:127.0.0.1]:80", "[2001:db8:0:0:0:0:0:1]:80"} {
+		"[fe80::1%eth0]:80", "[::ffff:127.0.0.1]:80", "[2001:db8:0:0:0:0:0:1]:80",
+		// A zone is a name an interface can have (#638): Linux's and macOS's, 15 bytes at most, or an
+		// interface index, which Go takes as a number.
+		"[fe80::1%en0]:80", "[fe80::1%utun3]:0", "[fe80::1%bridge100]:0", "[fe80::1%2]:80", "[fe80::1%abcdefghijklmno]:0"} {
 		for _, name := range []string{"BYWARD_LISTEN", "BYWARD_INTERNAL_LISTEN"} {
 			if _, err := load(t, nil, "BYWARD_LISTEN=127.0.0.1:1", name+"="+ok); err != nil {
-				t.Errorf("%s=%s: %v", name, ok, err)
+				t.Errorf("%s=%q: %v", name, ok, err)
 			}
 		}
 	}
@@ -1230,6 +1237,33 @@ func TestAListenAddressIsHostColonANumericPortAndARefusedOneIsNeverShown(t *test
 		{"[a b]:80", "it has brackets that do not enclose an IPv6 address alone"}, // before the host name characters too
 		{"[1.2.3.4]:http", "it has brackets that do not enclose an IPv6 address alone"},
 		{"[::1]", "it is not host:port"},
+		// A zone no interface can be named, by Linux's rule plus no control character (#638); bytes, as
+		// the kernel reads them, so à (C3 A0) holds its non-breaking space byte, though ü loads.
+		{"[::1%x y]:80", "it " + ruleZone},
+		{"[::1%x\ty]:80", "it " + ruleZone},
+		{"[::1%x\x01y]:80", "it " + ruleZone},
+		{"[::1%x\x7fy]:80", "it " + ruleZone},
+		{"[::1%]:80", "it " + ruleZone},
+		{"[::1%abcdefghijklmnop]:80", "it " + ruleZone},
+		{"[::1%.]:80", "it " + ruleZone},
+		{"[::1%..]:80", "it " + ruleZone},
+		{"[::1%a/b]:80", "it " + ruleZone},
+		{"[::1%/x]:80", "it " + ruleZone},
+		{"[::1%x\ny]:80", "it " + ruleZone},
+		{"[::1%x\vy]:80", "it " + ruleZone},
+		{"[::1%x\x1fy]:80", "it " + ruleZone},
+		{"[::1% %a]:80", "it " + ruleZone},
+		{"[::ffff:1.2.3.4%x y]:80", "it " + ruleZone}, // an IPv4-mapped IPv6 address has a zone too
+		{"[::1%a:b]:80", "it " + ruleZone},
+		{"[::1%\u00e0]:80", "it " + ruleZone},
+		{"[::1%" + canaryText + " x]:80", "it " + ruleZone},
+		// A zone only on an IPv6 address: a '%' after anything else is part of the host, which gets the host
+		// reason: after an address that is no IP address, or after an IPv4 one (the ':' after the '%' lets
+		// it past the brackets).
+		{"[zz:zz%a b]:80", "it has a host that is neither an IP address nor a host name"},
+		{"[1.2.3.4%a:b]:80", "it has a host that is neither an IP address nor a host name"},
+		// A '%' in a name is a character no host name holds.
+		{"my% x:80", "its host " + ruleNameChar + "3" + ruleNameChars},
 		// A ':' inside the brackets passes them, as host.Parse's rule does; a host that is still no IPv6
 		// address gets the host reason.
 		{"[a:b]:80", "it has a host that is neither an IP address nor a host name"},
@@ -1242,7 +1276,7 @@ func TestAListenAddressIsHostColonANumericPortAndARefusedOneIsNeverShown(t *test
 			want := fmt.Sprintf("%s: want %s; got a value (%d characters, not shown): %s", s.env, s.want, length(tc.value), tc.why)
 			_, err := load(t, nil, s.env+"="+tc.value)
 			if !isConfigError(err) || err.Error() != want || holdsCanary(err.Error()) {
-				t.Errorf("%s=%s: %v, want the error %q and never the value", s.env, tc.value, err, want)
+				t.Errorf("%s=%q: %v, want the error %q and never the value", s.env, tc.value, err, want)
 			}
 		}
 	}
