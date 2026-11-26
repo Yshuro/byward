@@ -7,7 +7,9 @@ import (
 	"io"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/byward-dev/byward/internal/config"
 	"github.com/byward-dev/byward/internal/logging"
@@ -123,8 +125,20 @@ func revokeUser(ctx context.Context, args, environ []string, stdout, stderr io.W
 		_, _ = fmt.Fprintln(stdout, "if you pasted a token, it revoked nothing: no user has that key")
 		return exitOK
 	}
-	_, _ = fmt.Fprintf(stdout, "revoked user %s in %s: their grants are gone and their tokens stop working within seconds\n", user, where)
+	_, _ = fmt.Fprintf(stdout, "revoked user %s in %s: their grants are gone and their tokens stop working within seconds\n", formatUserKey(user), where)
 	return exitOK
+}
+
+// formatUserKey quotes a user key on operator output when it contains a Unicode format character
+// (Cf, e.g. bidi overrides or zero-width spaces) or any non-printable rune, preventing terminal
+// display spoofing.
+func formatUserKey(user string) string {
+	for _, r := range user {
+		if unicode.Is(unicode.Cf, r) || !strconv.IsPrint(r) {
+			return fmt.Sprintf("%q", user)
+		}
+	}
+	return user
 }
 
 // operatorFailure reports an operator command's failure: exit 2 for these configuration mistakes:

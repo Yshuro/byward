@@ -760,6 +760,7 @@ func TestRevokeUserNamesACredentialShapedKeyOnlyByItsLength(t *testing.T) {
 		hidden     string // the key as the line names it; "" when it is shown in full
 	}{
 		{"sub", "eyJohn.Smith", "(12 characters, not shown)"},
+		{"sub", "eyJohn.\u202eSmith", "(13 characters, not shown)"},
 		{"sub", "eyJohn.Smith ", "(12 characters, not shown)"}, // judged trimmed: untrimmed, it no longer looks like one
 		{"sub", "eyJhbGciOiJSUzI1NiJ9." + canary + ".c2ln", "(35 characters, not shown)"},
 		{"sub", "f47ac10b-58cc-4372-a567-0e02b2c3d479", ""},
@@ -784,6 +785,27 @@ func TestRevokeUserNamesACredentialShapedKeyOnlyByItsLength(t *testing.T) {
 			}
 			if tc.hidden != "" && strings.Contains(stdout+stderr, strings.TrimSpace(tc.key)) {
 				t.Errorf("the key is shown: stdout %q, stderr %q", stdout, stderr)
+			}
+		})
+	}
+}
+
+func TestFormatUserKeyQuotesBidiAndInvisibleChars(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"bidi override", "al\u202eice@example.com", `"al\u202eice@example.com"`},
+		{"zero-width space", "a\u200bb", `"a\u200bb"`},
+		{"bom", "\ufeffbob", `"\ufeffbob"`},
+		{"non-ascii printable email", "jöhn@exämple.com", "jöhn@exämple.com"},
+		{"non-ascii printable name", "José", "José"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatUserKey(tc.in); got != tc.want {
+				t.Errorf("formatUserKey(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
 	}
