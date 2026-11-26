@@ -16,7 +16,7 @@ func (c *Config) upstream(v *Values, dashes bool) []error {
 	raw := parseText(v.value("upstream-command"))
 	var errs []error
 	if v.httpUpstream() || v.stdioUpstream() { // with none or both, the "required" or "both set" error says enough
-		errs = offModeSettings(v, v.stdioUpstream())
+		errs = offModeSettings(v)
 	}
 	if raw == "" {
 		if v.httpUpstream() { // the HTTP upstream's own settings, each reported even beside a malformed URL
@@ -99,40 +99,64 @@ func parseUpstreamCommand(val Value, argv []string) ([]string, error) {
 // upstream-command and upstream-url, as given, even when its value does not parse. With none or
 // both, no mode is chosen. Every check in config that depends on the chosen mode reads these.
 func (v *Values) stdioUpstream() bool {
-	return !v.empty("upstream-command") && v.empty("upstream-url")
+	return v.selects("upstream-command") && !v.selects("upstream-url")
 }
 
 func (v *Values) httpUpstream() bool {
-	return !v.empty("upstream-url") && v.empty("upstream-command")
+	return v.selects("upstream-url") && !v.selects("upstream-command")
 }
+
+// selects reports whether the upstream selector called name is given a value, read as given: empty
+// reads through refusedOffMode, which reads the mode from here.
+func (v *Values) selects(name string) bool { return !v.byKey[name].Given.empty() }
 
 // httpOnly are the settings outside the upstream groups that take effect only with an HTTP upstream:
 // the identity assertion, which a stdio upstream never gets (ADR-0016 §2, §6). Settings outside the
-// groups that refuse a stdio upstream with a hint of their own (identity-headers, obo-header,
-// store-postgres-dsn) keep it.
+// groups that refuse a stdio upstream with a hint of their own have a StdioHint instead.
 var httpOnly = map[string]bool{"assertion-keys-dir": true, "assertion-header": true, "assertion-claims": true, "assertion-unverified-email": true}
 
-// offModeSettings refuses each setting given for the upstream mode that is off: a stdio upstream's
-// settings with an HTTP upstream, an HTTP upstream's (and the httpOnly ones) with a stdio one. A
-// setting left at its default is never refused; one given is, a flag set to nothing included, as
-// every check for a family that is off does (#596). A variable set to nothing is unset already
-// (resolve), and a file named for a secret is given, even when the file is empty. The registry's
-// groups, and httpOnly, say which mode a setting is for. The other mode's selector reaches here only
-// as a flag set to nothing, as with a value there is no mode; upstream-credential keeps its own hint
-// (upstreamCredential).
-func offModeSettings(v *Values, stdio bool) []error {
-	offGroup, inUse, offMode, offSelector := GroupStdioUpstream, "HTTP", "a stdio upstream", Setting{Name: "upstream-command"}.Env()
-	if stdio {
-		offGroup, inUse, offMode, offSelector = GroupHTTPUpstream, "stdio", "an HTTP upstream", Setting{Name: "upstream-url"}.Env()
+// refusedOffMode reports whether the named setting is given for the upstream mode that is off, and so
+// refused (offModeSettings): a stdio upstream's settings with an HTTP upstream; an HTTP upstream's,
+// the httpOnly ones and those with a StdioHint with a stdio one. A setting left at its default never
+// is; one given is, a flag set to nothing included, as every check for a family that is off does
+// (#596). A variable set to nothing is unset already (resolve), and a file named for a secret is
+// given, even when it is not read. With no upstream, or both, there is no mode, so none is. A refused
+// setting is not read (resolve) or parsed (value, empty, given, emptySecretFile); a check that reads
+// its Source itself, through byKey or Effective, must skip it too, as checkNoAuth and inlineSecrets do.
+func (v *Values) refusedOffMode(name string) bool {
+	val := v.byKey[name]
+	if val.Source == SourceDefault {
+		return false
+	}
+	s := val.Setting
+	switch {
+	case v.httpUpstream():
+		return s.Group == GroupStdioUpstream
+	case v.stdioUpstream():
+		return s.Group == GroupHTTPUpstream || httpOnly[s.Name] || s.StdioHint != ""
+	}
+	return false
+}
+
+// offModeSettings refuses each setting given for the upstream mode that is off (refusedOffMode),
+// named as the operator gave it. Beside a stdio upstream, a setting with a StdioHint gets that hint;
+// every other refusal says which mode the setting is for. The other mode's selector reaches here only
+// as a flag set to nothing, as with a value there is no mode.
+func offModeSettings(v *Values) []error {
+	inUse, offMode, offSelector := "HTTP", "a stdio upstream", Setting{Name: "upstream-command"}.Env()
+	if v.stdioUpstream() {
+		inUse, offMode, offSelector = "stdio", "an HTTP upstream", Setting{Name: "upstream-url"}.Env()
 	}
 	var errs []error
 	for _, val := range v.Effective() {
 		s := val.Setting
-		forOff := s.Group == offGroup || stdio && httpOnly[s.Name]
-		if !forOff || val.Source == SourceDefault || s.Name == "upstream-credential" {
-			continue
+		switch {
+		case !v.refusedOffMode(s.Name):
+		case s.StdioHint != "": // refused, so beside a stdio upstream: a stdio upstream's setting takes no hint (checkStdioHints)
+			errs = append(errs, errorf(s.StdioHint, v.NameAsGiven(s.Name)))
+		default:
+			errs = append(errs, errorf("%s is set, but the upstream is %s: it applies only to %s (%s); remove it", spelled(val), inUse, offMode, offSelector))
 		}
-		errs = append(errs, errorf("%s is set, but the upstream is %s: it applies only to %s (%s); remove it", spelled(val), inUse, offMode, offSelector))
 	}
 	return errs
 }
@@ -186,15 +210,13 @@ func parseHeaderTimeout(val Value) (time.Duration, error) {
 const maxUpstreamCredential = 4 << 10
 
 // upstreamCredential reads the operator's upstream credential (ADR-0016 §7): only for an HTTP
-// upstream, a header value without control characters, in a header that is not the assertion's.
-// The credential's errors name it as the operator gave it (spelled), never its value.
+// upstream (beside a stdio one, its StdioHint refuses it), a header value without control
+// characters, in a header that is not the assertion's. The credential's errors name it as the
+// operator gave it (spelled), never its value.
 func (c *Config) upstreamCredential(v *Values) []error {
 	fileEnv, hEnv := lookup("upstream-credential").FileEnv(), Setting{Name: "upstream-credential-header"}.Env()
 	val, header := v.byKey["upstream-credential"], v.byKey["upstream-credential-header"]
-	if !v.httpUpstream() { // with stdio the header is an off-mode setting; with no upstream or both, upstream's error says enough
-		if v.stdioUpstream() && val.Source != SourceDefault {
-			return []error{errorf("%s is for an HTTP upstream; give a stdio upstream its credential with BYWARD_UPSTREAM_ENV_FILE", spelled(val))}
-		}
+	if !v.httpUpstream() { // with stdio both are off-mode settings; with no upstream or both, upstream's error says enough
 		return nil
 	}
 	if val.Source == SourceDefault {

@@ -34,6 +34,11 @@ type Setting struct {
 	// Help gives empty a meaning of its own. Otherwise (the rule) set to nothing is as if unset, since
 	// env templates list every variable (#428).
 	EmptyIsGiven bool
+	// StdioHint is the refusal of the setting beside a stdio upstream, which it has no effect on, for a
+	// setting that is not a stdio upstream's whose refusal says what to use instead (offModeSettings). It
+	// is fixed text, with %[1]s for the setting as the operator gave it and no other verb
+	// (checkStdioHints, at init), so it never shows a value.
+	StdioHint string
 	// shape decides how the value is shown (ADR-0031 §3); secretShape also means the value is read
 	// only from a file. Every registry entry has one (checkShapes, at init).
 	shape *shape
@@ -123,7 +128,8 @@ type Value struct {
 type SecretFile struct{ From, Path string }
 
 // SecretFiles lists the files secrets were read from, in registry order; the server checks their
-// permissions (ADR-0018 §11).
+// permissions (ADR-0018 §11). It also lists the file of a secret refused for the upstream mode that
+// is off, which resolve never opens; harmless, as Load fails on that refusal.
 func (v *Values) SecretFiles() []SecretFile {
 	var out []SecretFile
 	for _, n := range v.order {
@@ -182,11 +188,16 @@ type Values struct {
 }
 
 // value is the named setting's Value, for its parser. It panics on a name these Values do not hold,
-// which every test that loads the setting catches, so a parser never gets a Value without a shape.
+// which every test that loads the setting catches, so a parser never gets a Value without a shape. A
+// setting refused for the upstream mode that is off is read as its default: refused, it is not
+// parsed, so its refusal is its one error (offModeSettings, #631).
 func (v *Values) value(name string) Value {
 	val, ok := v.byKey[name]
 	if !ok {
 		panic("config: no setting " + name)
+	}
+	if v.refusedOffMode(name) {
+		return Value{Setting: val.Setting, Given: NewOpaque(val.Setting.Default), Source: SourceDefault}
 	}
 	return val
 }
@@ -201,15 +212,21 @@ func (v *Values) holds(name string) bool {
 	return ok
 }
 
-// empty reports whether the named setting's value is empty: unset, or set to nothing.
-func (v *Values) empty(name string) bool { return v.byKey[name].Given.empty() }
+// empty reports whether the named setting's value is empty: unset, or set to nothing. A setting refused
+// for the upstream mode that is off is read as its default, as value reads it (#631).
+func (v *Values) empty(name string) bool { return v.value(name).Given.empty() }
 
 // given reports whether the operator gave the named setting a value, or a file for a secret, which is
-// given even when it is empty, so it never falls back to another choice. A variable set to nothing
-// never reaches here (resolve takes it as unset, Setting.EmptyIsGiven), nor does a _FILE variable set
-// to nothing, which names no file. A flag set to nothing is not given here, though a check that reads
-// its Source counts it: every check that refuses a family's settings while the family is off does.
+// given even when it is empty, so it never falls back to another choice. A setting refused for the
+// upstream mode that is off is not given here, as value reads it as its default: refused, it is not
+// checked further (#631). A variable set to nothing never reaches here (resolve takes it as unset,
+// Setting.EmptyIsGiven), nor does a _FILE variable set to nothing, which names no file. A flag set to
+// nothing is not given here, though a check that reads its Source counts it: every check that refuses
+// a family's settings while the family is off does.
 func (v *Values) given(name string) bool {
+	if v.refusedOffMode(name) {
+		return false
+	}
 	val := v.byKey[name]
 	return !val.Given.empty() || val.Path != ""
 }
@@ -229,24 +246,27 @@ func spelled(val Value) string {
 // NameAsGiven names the setting called name as the operator gave it, for any message that names it:
 // a refusal, a warning or a doctor fix (#619). That is the flag or variable that gave it (spelled), so
 // a bad --oidc-client-key-file is not named BYWARD_OIDC_CLIENT_KEY_FILE. A setting left at its
-// default, or nil Values (a Config built by hand), names the variable to set (EnvToSet). It panics
-// for a name the registry does not hold.
+// default, or nil Values (a Config built by hand), names the variable to set (EnvToSet), from the
+// Values' own Setting where they hold it. It panics for a name neither they nor the registry hold.
 func (v *Values) NameAsGiven(name string) string {
-	s := lookup(name)
 	if v == nil {
-		return s.EnvToSet()
+		return lookup(name).EnvToSet()
 	}
-	if val, ok := v.byKey[name]; ok && val.Source != SourceDefault {
-		return spelled(val)
+	val, ok := v.byKey[name]
+	switch { // from v's own Setting: Values resolved over another registry hold settings lookup does not
+	case !ok:
+		return lookup(name).EnvToSet()
+	case val.Source == SourceDefault:
+		return val.Setting.EnvToSet()
 	}
-	return s.EnvToSet()
+	return spelled(val)
 }
 
 // emptySecretFile is the error for a secret setting whose named file holds nothing, or only
 // whitespace, naming the setting as the operator gave it; nil otherwise.
 func (v *Values) emptySecretFile(name string) error {
 	switch val := v.byKey[name]; {
-	case val.Path == "":
+	case val.Path == "" || v.refusedOffMode(name): // refused, its file is never read (readSecretFiles)
 		return nil
 	case val.Given.empty():
 		return errorf("%s: the file is empty", val.From)
@@ -343,22 +363,14 @@ func resolve(reg []Setting, args, environ []string, readFile readFileFunc, extra
 			if env[s.Env()] != "" { // set to nothing is as if unset (#428)
 				return nil, bothSet(s.Env(), from)
 			}
-			raw, err := readSecret(readFile, s, *fileFlagVals[s.Name], from)
-			if err != nil {
-				return nil, err
-			}
-			v.Given, v.Source, v.Path, v.From = NewOpaque(raw), SourceFile, *fileFlagVals[s.Name], from
+			v.Given, v.Source, v.Path, v.From = NewOpaque(""), SourceFile, *fileFlagVals[s.Name], from // read by readSecretFiles
 		case !s.Secret() && set[s.Name]:
 			v.Given, v.Source = NewOpaque(*flagVals[s.Name]), SourceFlag
 		case s.Secret() && env[s.FileEnv()] != "":
 			if env[s.Env()] != "" { // set to nothing is as if unset (#428)
 				return nil, bothSet(s.Env(), s.FileEnv())
 			}
-			raw, err := readSecret(readFile, s, env[s.FileEnv()], s.FileEnv())
-			if err != nil {
-				return nil, err
-			}
-			v.Given, v.Source, v.Path, v.From = NewOpaque(raw), SourceFile, env[s.FileEnv()], s.FileEnv()
+			v.Given, v.Source, v.Path, v.From = NewOpaque(""), SourceFile, env[s.FileEnv()], s.FileEnv() // read by readSecretFiles
 		default:
 			if e, ok := env[s.Env()]; ok && (e != "" || s.EmptyIsGiven) { // set to nothing is as if unset (Setting.EmptyIsGiven)
 				v.Given, v.Source = NewOpaque(e), SourceEnv
@@ -382,7 +394,30 @@ func resolve(reg []Setting, args, environ []string, readFile readFileFunc, extra
 		vals.byKey[commandSetting] = v
 		vals.command = command
 	}
+	if err := vals.readSecretFiles(readFile); err != nil {
+		return nil, err
+	}
 	return vals, nil
+}
+
+// readSecretFiles reads each secret given by its file, in registry order, once every setting and a
+// command after -- are resolved, so the upstream mode is known: the file of a secret refused for the
+// mode that is off is never opened (#631), so its refusal is its one error. Such a secret keeps its
+// Path, and so is listed by SecretFiles; that is harmless, as Load then fails on the refusal.
+func (v *Values) readSecretFiles(readFile readFileFunc) error {
+	for _, name := range v.order {
+		val := v.byKey[name]
+		if val.Source != SourceFile || v.refusedOffMode(name) {
+			continue
+		}
+		raw, err := readSecret(readFile, val.Setting, val.Path, val.From)
+		if err != nil {
+			return err
+		}
+		val.Given = NewOpaque(raw)
+		v.byKey[name] = val
+	}
+	return nil
 }
 
 // flagError is err, the flag package's refusal of args, without any text of the operator's
@@ -455,7 +490,7 @@ func refusedFlag(fs *flag.FlagSet, msg string) *flag.Flag {
 func (v *Values) inlineSecrets() []Setting {
 	var out []Setting
 	for _, val := range v.Effective() {
-		if val.Setting.Secret() && val.Source == SourceEnv {
+		if val.Setting.Secret() && val.Source == SourceEnv && !v.refusedOffMode(val.Setting.Name) { // refused, its refusal (its hint or "remove it") is its one error (#631)
 			out = append(out, val.Setting)
 		}
 	}

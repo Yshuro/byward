@@ -137,7 +137,7 @@ func pathLeakScenarios() []pathLeakScenario {
 			return []string{"BYWARD_ENTRA_FEDERATED_TOKEN_FILE=" + filepath.Join(dir, "token"), "BYWARD_ENTRA_CLIENT_SECRET_FILE="}
 		}, nil},
 		missingSecretFile("BYWARD_UPSTREAM_CREDENTIAL_FILE", "upstream-credential"),
-		missingSecretFile("BYWARD_UPSTREAM_ENV_FILE", "upstream-env"),
+		besideStdio(missingSecretFile("BYWARD_UPSTREAM_ENV_FILE", "upstream-env")), // its file is opened only beside stdio (#631)
 		missingSecretFile("BYWARD_ENTRA_CLIENT_CERTIFICATE_FILE", "entra-client-certificate"),
 		missingSecretFile("BYWARD_OIDC_CLIENT_SECRET_FILE", "oidc-client-secret"),
 		missingSecretFile("BYWARD_OIDC_CLIENT_KEY_FILE", "oidc-client-key"),
@@ -152,6 +152,23 @@ func missingSecretFile(env, setting string) pathLeakScenario {
 	return pathLeakScenario{"a missing " + setting + " file", env, says, func(_ *testing.T, dir string) []string {
 		return []string{env + "=" + filepath.Join(dir, setting)}
 	}, nil}
+}
+
+// besideStdio runs sc with a stdio upstream in place of the HTTP one, as a stdio upstream's file
+// setting is read only beside one (#631). The command goes after --, not in BYWARD_UPSTREAM_COMMAND,
+// as the leak test counts any other variable with a value as a companion file; BYWARD_UPSTREAM_URL set to
+// nothing is unset (#428).
+func besideStdio(sc pathLeakScenario) pathLeakScenario {
+	sc.name += " beside a stdio upstream"
+	env := sc.env
+	sc.env = func(t *testing.T, dir string) []string {
+		return append([]string{"BYWARD_UPSTREAM_URL="}, env(t, dir)...)
+	}
+	sc.commands = nil
+	for _, args := range refusingCommands {
+		sc.commands = append(sc.commands, append(slices.Clone(args), "--", "/usr/bin/server"))
+	}
+	return sc
 }
 
 // A file setting whose file cannot be used is named by its setting and cause, never its path, in
