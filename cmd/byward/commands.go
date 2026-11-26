@@ -97,7 +97,21 @@ func operatorLoad(args, environ []string, stderr io.Writer) (*config.Config, boo
 // revokeUser is revoke-user (ADR-0006 §9).
 func revokeUser(ctx context.Context, args, environ []string, stdout, stderr io.Writer) int {
 	flags, upstream := splitAtDashes(args)
-	if len(flags) != 1 {
+	var key string
+	switch {
+	case len(flags) == 1 && (flags[0] == "-h" || flags[0] == "--help"):
+		_, _ = fmt.Fprintln(stdout, "byward: usage: byward revoke-user <user key> [-- stdio-upstream-command [args...]]")
+		return exitOK
+	case len(flags) == 1 && !strings.HasPrefix(flags[0], "-"):
+		key = flags[0]
+	case len(flags) == 0 && len(upstream) >= 2:
+		key = upstream[1]
+		if len(upstream) > 2 {
+			upstream = upstream[2:]
+		} else {
+			upstream = nil
+		}
+	default:
 		_, _ = fmt.Fprintln(stderr, "byward: usage: byward revoke-user <user key> [-- stdio-upstream-command [args...]]")
 		return exitConfig
 	}
@@ -105,7 +119,6 @@ func revokeUser(ctx context.Context, args, environ []string, stdout, stderr io.W
 	if !ok {
 		return exitConfig
 	}
-	key := flags[0]
 	user, where, err := server.RevokeUser(ctx, cfg, logging.New(stderr, cfg.LogFormat), key)
 	switch {
 	case errors.Is(err, server.ErrNotAUserKey):
