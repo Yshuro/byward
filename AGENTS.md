@@ -10,6 +10,9 @@ first-class Microsoft Entra ID support. Single Go binary. Scope and non-goals: A
 - Decisions live in `docs/adr/`. Read the relevant ADR before changing a design.
 - Work items live in GitHub Issues (`gh issue view <n>`). The docs index is `docs/README.md`.
 - When grilling a feature, walk `docs/quality-lenses.md`.
+- Reuse before writing. Before adding a helper, fake, parser or test recorder, search `origin/main`
+  for one that already does it and extend it. Shared code is extracted into one helper at its
+  third caller; until then, the second copy cites the first.
 
 ## Commands
 
@@ -59,6 +62,14 @@ All tools are pinned in `mise.toml`; `mise run` resolves them, no shell activati
 - **Rounds:** round 1 runs every angle of the tier. After that, re-run only the angles that had
   findings or whose files a fix touched; the last of those rounds must be clean. Stop after 5
   rounds. Anything still open goes in the PR description or a `ready-for-agent` issue.
+- **Severity gate:** a finding is fixed in the PR only when it breaks a security invariant, is a
+  correctness bug an operator, user or client can hit, or duplicates existing code. Anything else
+  goes to the PR's "Known residuals" with one line why, or is dropped: wording, an input no real
+  client or operator sends, a new golden column or family with no production check behind it.
+  The same-gap rule below still decides where class findings go. A finding sent to Known
+  residuals or dropped doesn't keep a round open.
+- **No new abstraction:** a sweep fix may not add an interface or abstraction with fewer than 3
+  callers. SOLID findings are fixed within that limit.
 - **Same gap elsewhere:** a finding that another setting, check or surface has the gap the PR fixes
   doesn't become a new per-instance issue. It goes into that class's golden or walk (#656, #657,
   #658), or into "Known gaps" in `docs/security-posture.md`. A class with no golden or walk

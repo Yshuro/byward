@@ -31,3 +31,11 @@ Several agents often work on this repo at once. These rules keep their work from
   coordinating session watch checks, or wait at least 60 s between polls.
 - **One session files issues.** When several agents work at once, send issue drafts to the
   coordinating session instead of filing them, so nothing is filed twice.
+- **Closing keywords before the queue.** Before it enqueues a PR, the coordinating session checks
+  that every issue the PR finishes is in a closing keyword in its body.
+- **Weekly triage.** The coordinating session triages `needs-triage` issues at least once a week.
+- **Fix review at each release cut.** Classify the fixes since the last release by cause: a second
+  copy of a rule, complexity, unrequested scope, or a missing lifecycle cell. A new class goes into
+  a class issue, and a new rule into these docs.
+- **A rule that can be checked mechanically becomes a test** (a registry walk, a source scan or a
+  golden), not prose.
