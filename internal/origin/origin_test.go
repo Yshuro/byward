@@ -152,6 +152,8 @@ func TestInternalListenerAcceptsAddressesAndListedNamesOnly(t *testing.T) {
 		// or any other port names no host, and is refused, as is a shape CutHostname takes that names
 		// no listed host or address (an empty host before a port, [not an address:]).
 		"[::1]": http.StatusNoContent, "::1": http.StatusNoContent, "127.0.0.1:": http.StatusNoContent,
+		// An IPv6 address with a zone, which a client strips before it sends Host (#652); without it, the address passes.
+		"[fe80::1%eth0]:9090": http.StatusMisdirectedRequest, "[fe80::1%25eth0]:9090": http.StatusMisdirectedRequest, "[fe80::1]:9090": http.StatusNoContent,
 		"127.0.0.1:65535": http.StatusNoContent, "byward-metrics.monitoring.svc:10250": http.StatusNoContent,
 		"[byward-metrics.monitoring.svc]:9090": http.StatusMisdirectedRequest, "[mcp.example.com]:443": http.StatusMisdirectedRequest,
 		"[127.0.0.1]:80": http.StatusMisdirectedRequest, "[0.0.0.0]": http.StatusMisdirectedRequest,
@@ -235,6 +237,16 @@ func TestInternalListenerAcceptsAddressesAndListedNamesOnly(t *testing.T) {
 		if w.Code != http.StatusMisdirectedRequest {
 			t.Errorf("Host %q: %d, want 421", in, w.Code)
 		}
+	}
+}
+
+// An IPv6 address with a zone is refused whatever the allowed list holds: config refuses a zoned
+// entry, and the internal listener does not rely on it (#652).
+func TestTheInternalListenerRefusesAZoneEvenWhenTheListNamesIt(t *testing.T) {
+	w := httptest.NewRecorder()
+	InternalHosts(quiet(), []string{"[fe80::1%eth0]:9090"}, ok).ServeHTTP(w, withHost("[fe80::1%eth0]:9090"))
+	if w.Code != http.StatusMisdirectedRequest {
+		t.Fatalf("a zoned Host the list names: %d, want 421", w.Code)
 	}
 }
 
