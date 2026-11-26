@@ -1,9 +1,11 @@
 package config
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"maps"
 	"regexp"
 	"slices"
 	"strconv"
@@ -27,7 +29,8 @@ var variableMethods = []string{"Env", "EnvToSet", "FileEnv"}
 
 // variableNamingsOf scans the function bodies of the Go source src (read from file when src is nil)
 // for variableNamings. variables are the names a string literal must not spell. Package-level
-// declarations, such as the registry's help text, are not scanned.
+// declarations, such as the registry's help text, are not scanned; the refusals beside a stdio
+// upstream are checked apart (TestARefusalBesideStdioNamesAnotherSettingsVariableOnlyAsAllowedAdvice).
 func variableNamingsOf(t *testing.T, file string, src any, variables map[string]bool) []variableNaming {
 	t.Helper()
 	f, err := parser.ParseFile(token.NewFileSet(), file, src, parser.SkipObjectResolution)
@@ -108,6 +111,123 @@ func TestNoRefusalNamesASettingByItsVariableWhateverTheSource(t *testing.T) {
 		if !seen[key] {
 			t.Errorf("%s is allowed a variable from a Setting (it %s), but the scan finds none there: remove it from the list", key, why)
 		}
+	}
+}
+
+// allowedHintVariables are the settings' variables a refusal beside a stdio upstream may name, each
+// for its reason: a hint names a second setting by its variable as advice, the variable to set
+// (#633).
+var allowedHintVariables = map[string]string{
+	"BYWARD_UPSTREAM_URL":      "httpOnlyRefusal, the hint and the fallback of a setting only an HTTP upstream reads, names the HTTP upstream's selector",
+	"BYWARD_UPSTREAM_ENV_FILE": "upstream-credential's hint names where a stdio upstream gets its credential instead",
+}
+
+// A refusalText is a text offModeSettings gives beside a stdio upstream, and whose it is.
+type refusalText struct{ owner, text string }
+
+// stdioRefusals are the texts offModeSettings gives beside a stdio upstream: each StdioHint of reg,
+// and httpOnlyRefusal, its fallback for a setting without one. The naming scan skips package-level
+// declarations, the registry and httpOnlyRefusal among them, so they are read here.
+func stdioRefusals(reg []Setting) []refusalText {
+	texts := []refusalText{{"offModeSettings' fallback (httpOnlyRefusal)", httpOnlyRefusal}}
+	for _, s := range reg {
+		if s.StdioHint != "" {
+			texts = append(texts, refusalText{"the StdioHint of " + s.Name, s.StdioHint})
+		}
+	}
+	return texts
+}
+
+// hintVariables are the variables, among variables, that texts spell, each with the owners of the
+// texts that spell it.
+func hintVariables(texts []refusalText, variables map[string]bool) map[string][]string {
+	found := map[string][]string{}
+	for _, t := range texts {
+		for _, v := range variableRef.FindAllString(t.text, -1) {
+			if variables[v] {
+				found[v] = append(found[v], t.owner)
+			}
+		}
+	}
+	return found
+}
+
+// hintVariableProblems are the ways texts break the list allowed: a setting's variable, among
+// variables, that a text names and the list does not, and a listed one that no text names any more,
+// so the list stays exact.
+func hintVariableProblems(texts []refusalText, variables map[string]bool, allowed map[string]string) []string {
+	found := hintVariables(texts, variables)
+	var problems []string
+	for _, v := range slices.Sorted(maps.Keys(found)) {
+		if _, ok := allowed[v]; !ok {
+			problems = append(problems, fmt.Sprintf("%s names %s: name a setting by its variable in a refusal only as advice, and list it in allowedHintVariables with the reason", strings.Join(found[v], ", "), v))
+		}
+	}
+	for _, v := range slices.Sorted(maps.Keys(allowed)) {
+		if len(found[v]) == 0 {
+			problems = append(problems, fmt.Sprintf("%s is allowed in a refusal beside a stdio upstream (%s), but none names it: remove it from the list", v, allowed[v]))
+		}
+	}
+	return problems
+}
+
+// A refusal beside a stdio upstream, a StdioHint or offModeSettings' fallback, names another setting
+// by its variable only as advice, the variable to set, and only one listed in allowedHintVariables
+// with its reason (#633): the naming scan cannot see them, as they are package-level. A listed
+// variable that none names any more fails too.
+func TestARefusalBesideStdioNamesAnotherSettingsVariableOnlyAsAllowedAdvice(t *testing.T) {
+	for _, p := range hintVariableProblems(stdioRefusals(registry), knownVariables(registry), allowedHintVariables) {
+		t.Error(p)
+	}
+}
+
+// The list fails a text that names a setting's variable it does not hold, naming every text that does,
+// in order of the variable; and a listed variable that no text names, in order too. A text that names
+// only a listed variable, or one that is no setting's, passes.
+func TestTheRefusalVariableListFailsAnUnlistedVariableAndOneNoTextNames(t *testing.T) {
+	variables := map[string]bool{"BYWARD_LISTEN": true, "BYWARD_TRUSTED_PROXIES": true, "BYWARD_ALLOWED_ORIGINS": true}
+	listen := map[string]string{"BYWARD_LISTEN": "the probe's advice"}
+	unlisted := func(owners, v string) string {
+		return owners + " names " + v + ": name a setting by its variable in a refusal only as advice, and list it in allowedHintVariables with the reason"
+	}
+	unnamed := func(v, reason string) string {
+		return v + " is allowed in a refusal beside a stdio upstream (" + reason + "), but none names it: remove it from the list"
+	}
+	for _, tc := range []struct {
+		name    string
+		texts   []refusalText
+		allowed map[string]string
+		want    []string
+	}{
+		{"a listed variable", []refusalText{{"a", "%[1]s: set BYWARD_LISTEN instead"}}, listen, nil},
+		{"a variable that is no setting's", []refusalText{{"a", "%[1]s: the stdio process gets BYWARD_SUBJECT"}}, nil, nil},
+		{"an unlisted variable", []refusalText{{"a", "%[1]s: set BYWARD_LISTEN instead"}}, nil, []string{unlisted("a", "BYWARD_LISTEN")}},
+		{"an unlisted variable two texts name", []refusalText{{"a", "%[1]s: set BYWARD_LISTEN"}, {"b", "%[1]s: or BYWARD_LISTEN"}}, nil,
+			[]string{unlisted("a, b", "BYWARD_LISTEN")}},
+		{"three unlisted variables, in order", []refusalText{{"a", "%[1]s: set BYWARD_TRUSTED_PROXIES, BYWARD_LISTEN or BYWARD_ALLOWED_ORIGINS"}}, nil,
+			[]string{unlisted("a", "BYWARD_ALLOWED_ORIGINS"), unlisted("a", "BYWARD_LISTEN"), unlisted("a", "BYWARD_TRUSTED_PROXIES")}},
+		{"a listed variable no text names", []refusalText{{"a", "%[1]s is for an HTTP upstream"}}, listen,
+			[]string{unnamed("BYWARD_LISTEN", "the probe's advice")}},
+		{"three listed variables no text names, in order", []refusalText{{"a", "%[1]s is for an HTTP upstream"}},
+			map[string]string{"BYWARD_TRUSTED_PROXIES": "the third", "BYWARD_LISTEN": "the second", "BYWARD_ALLOWED_ORIGINS": "the first"},
+			[]string{unnamed("BYWARD_ALLOWED_ORIGINS", "the first"), unnamed("BYWARD_LISTEN", "the second"), unnamed("BYWARD_TRUSTED_PROXIES", "the third")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hintVariableProblems(tc.texts, variables, tc.allowed); !slices.Equal(got, tc.want) {
+				t.Errorf("problems = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// The texts read are every StdioHint and offModeSettings' fallback, so a variable the fallback names
+// stays listed when no StdioHint names it any more.
+func TestTheRefusalsBesideStdioAreEveryHintAndTheFallback(t *testing.T) {
+	reg := []Setting{{Name: "hinted", StdioHint: "%[1]s: its own"}, {Name: "plain"}}
+	got := stdioRefusals(reg)
+	want := []refusalText{{"offModeSettings' fallback (httpOnlyRefusal)", httpOnlyRefusal}, {"the StdioHint of hinted", "%[1]s: its own"}}
+	if !slices.Equal(got, want) {
+		t.Errorf("stdioRefusals = %q, want %q", got, want)
 	}
 }
 
