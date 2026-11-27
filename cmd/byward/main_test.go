@@ -329,7 +329,9 @@ func TestRevokeCommandsExit2OnMisuseOrNoStore1OnAStoreFailureAndNameTheRevokedUs
 	}{
 		{"revoke-user without a key", []string{"revoke-user"}, noStore, exitConfig, "", revokeUserUsage},
 		{"revoke-user with two keys", []string{"revoke-user", user, user}, noStore, exitConfig, "", revokeUserUsage},
-		{"revoke-user with an email", []string{"revoke-user", "alice@contoso.example"}, noStore, exitConfig, "", `byward: revoke-user "alice@contoso.example": not a user key: with Entra, tid:oid, the tenant and object IDs of the user; with an oidc IdP, the value of its subject claim (BYWARD_OIDC_SUBJECT_CLAIM, default sub), as the audit records' user_key shows it` + "\n"},
+		{"revoke-user with an email", []string{"revoke-user", "alice@contoso.example"}, noStore, exitConfig, "", `byward: revoke-user (21 characters, not shown): not a user key: with Entra, tid:oid, the tenant and object IDs of the user; with an oidc IdP, the value of its subject claim (BYWARD_OIDC_SUBJECT_CLAIM, default sub; a sub is at most 255 printable ASCII characters), as the audit records' user_key shows it` + "\n"},
+		{"revoke-user with an empty key", []string{"revoke-user", ""}, noStore, exitConfig, "", `byward: revoke-user (0 characters, not shown): not a user key: with Entra, tid:oid, the tenant and object IDs of the user; with an oidc IdP, the value of its subject claim (BYWARD_OIDC_SUBJECT_CLAIM, default sub; a sub is at most 255 printable ASCII characters), as the audit records' user_key shows it` + "\n"},
+		{"revoke-user with a non-ASCII email, named by its characters, not bytes", []string{"revoke-user", "jöhn@exämple.com"}, noStore, exitConfig, "", `byward: revoke-user (16 characters, not shown): not a user key: with Entra, tid:oid, the tenant and object IDs of the user; with an oidc IdP, the value of its subject claim (BYWARD_OIDC_SUBJECT_CLAIM, default sub; a sub is at most 255 printable ASCII characters), as the audit records' user_key shows it` + "\n"},
 		{"revoke-all without --yes", []string{"revoke-all"}, noStore, exitConfig, "", revokeAllUsage},
 		{"revoke-all with yes instead of --yes", []string{"revoke-all", "yes"}, noStore, exitConfig, "", revokeAllUsage},
 		{"revoke-all with --yes and more", []string{"revoke-all", "--yes", "extra"}, noStore, exitConfig, "", revokeAllUsage},
@@ -744,5 +746,45 @@ func blankOTELEnv(t *testing.T) {
 		if k, _, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "OTEL_") {
 			t.Setenv(k, "")
 		}
+	}
+}
+
+// revoke-user prints a user key that looks like a credential (logging.LooksSecret) only by its length
+// in characters, under any subject claim, and says a pasted token revoked nothing (#594). Such a key
+// is still revoked: a sub such as eyJohn.Smith, or a name such as "Ann Basic Lee", is a real user's.
+// Any other key is printed as given.
+func TestRevokeUserNamesACredentialShapedKeyOnlyByItsLength(t *testing.T) {
+	const hint = "if you pasted a token, it revoked nothing: no user has that key\n"
+	for _, tc := range []struct {
+		claim, key string
+		hidden     string // the key as the line names it; "" when it is shown in full
+	}{
+		{"sub", "eyJohn.Smith", "(12 characters, not shown)"},
+		{"sub", "eyJohn.Smith ", "(12 characters, not shown)"}, // judged trimmed: untrimmed, it no longer looks like one
+		{"sub", "eyJhbGciOiJSUzI1NiJ9." + canary + ".c2ln", "(35 characters, not shown)"},
+		{"sub", "f47ac10b-58cc-4372-a567-0e02b2c3d479", ""},
+		{"name", "Ann Basic Lee", "(13 characters, not shown)"},
+		{"name", "Ånn Basic Lee", "(13 characters, not shown)"},
+		{"email", "heyJoe.Smith.Jr@example.com", "(27 characters, not shown)"},
+		{"email", "jöhn@exämple.com", ""},
+		{"name", "José", ""},
+	} {
+		t.Run(tc.claim+"/"+tc.key, func(t *testing.T) {
+			env, _, _ := operatorEnv(t, proxysStore)
+			env = append(without(env, "BYWARD_ENTRA_"), "BYWARD_OIDC_CLIENT_SECRET_FILE="+setting(env, "BYWARD_ENTRA_CLIENT_SECRET_FILE"),
+				"BYWARD_IDP=keycloak", "BYWARD_OIDC_ISSUER=https://sso.example.com/realms/acme", "BYWARD_OIDC_CLIENT_ID=byward",
+				"BYWARD_GATE_ALLOW_EMPTY=true", "BYWARD_OIDC_SUBJECT_CLAIM="+tc.claim)
+			code, stdout, stderr := runWith([]string{"revoke-user", tc.key}, env...)
+			want := "revoked user " + tc.key + " in BYWARD_STORE_DIR" + revoked
+			if tc.hidden != "" {
+				want = "revoked user " + tc.hidden + ", a key that looks like a credential, in BYWARD_STORE_DIR" + revoked + hint
+			}
+			if code != exitOK || stdout != want {
+				t.Fatalf("code %d, stdout %q, stderr %q; want exit 0 and %q", code, stdout, stderr, want)
+			}
+			if tc.hidden != "" && strings.Contains(stdout+stderr, strings.TrimSpace(tc.key)) {
+				t.Errorf("the key is shown: stdout %q, stderr %q", stdout, stderr)
+			}
+		})
 	}
 }

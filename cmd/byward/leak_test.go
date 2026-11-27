@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -12,8 +13,11 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/byward-dev/byward/internal/config"
+	"github.com/byward-dev/byward/internal/logging"
+	"github.com/byward-dev/byward/internal/server"
 	"github.com/byward-dev/byward/internal/testutil/pgtest"
 )
 
@@ -396,6 +400,25 @@ func TestInitShowsAValueItWasGivenOnlyInTheScriptItPrints(t *testing.T) {
 	}
 }
 
+// revoke-user shows no key it was given: under Entra, a token pasted where the user key belongs is
+// refused (it is no tid:oid), and named by its length, as init names a value it refuses (#594, ADR-0031 §1). Every form of a secret,
+// and a token's three segments, is given as the key; each must reach the refusal and show nothing.
+func TestRevokeUserShowsNoKeyItWasGiven(t *testing.T) {
+	keys := append(slices.Clone(secretForms), struct{ name, value string }{"JWT", "eyJhbGciOiJSUzI1NiJ9." + canary + ".c2lnbmF0dXJl"})
+	for _, key := range keys {
+		t.Run(key.name, func(t *testing.T) {
+			code, stdout, stderr := runWith([]string{"revoke-user", key.value}, append(authEnv(t), serveEnv("https://m.example/mcp", "127.0.0.1:0")...)...)
+			want := "byward: revoke-user " + logging.NotShown(key.value) + ": " + server.ErrNotAUserKey.Error() + "\n"
+			if code != exitConfig || stdout != "" || stderr != want {
+				t.Fatalf("code %d (want %d), stdout %q, stderr %q; want only %q", code, exitConfig, stdout, stderr, want)
+			}
+			if shows(stdout + stderr) {
+				t.Errorf("the key given is shown: stdout %q, stderr %q", stdout, stderr)
+			}
+		})
+	}
+}
+
 // redirectStderr sends os.Stderr and the log package (slog's default logger writes through it) to a file
 // until the test ends, and returns a function that reads what was written there since it last read, failing
 // the test (or subtest) it is given if it cannot. It swaps variables, not file descriptor 2. No test in
@@ -420,5 +443,104 @@ func redirectStderr(t *testing.T) func(*testing.T) string {
 		got := string(b[read:])
 		read = len(b)
 		return got
+	}
+}
+
+// tokenForms are tokens and credentials pasted where a user key belongs (#594). Entra refuses each,
+// as no tid:oid. Under an oidc IdP keyed on sub, a form within the 255 ASCII characters OIDC Core 1.0
+// §2 allows a sub is a key (subOK), and one longer is refused.
+var tokenForms = []struct {
+	name, value string
+	subOK       bool
+}{
+	{"a compact JWS", "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhIn0.LK7CANARY", true},
+	{"a JWS longer than a sub", "eyJhbGciOiJSUzI1NiJ9." + strings.Repeat("eyJzdWIiOiJhIn0", 16) + ".LK7CANARY", false},
+	{"a Bearer credential", "Bearer LK7CANARY", true},
+}
+
+// The operator commands show no argument they were given, whether they refuse it or take it (#594). Every command but
+// revoke-user and init takes only fixed words, so a value after them gets the command's usage line;
+// init has TestInitShowsAValueItWasGivenOnlyInTheScriptItPrints. revoke-user under an oidc IdP keyed on
+// sub takes a key as OIDC Core allows a sub: every secret form is within that rule, so it is taken
+// (these runs have no store, so none is revoked or shown), and a token form longer than a sub is
+// refused and named by its length. Entra refuses every token form (TestRevokeUserShowsNoKeyItWasGiven
+// covers its other forms). Every command in the commands map has a cell here or names its test. Nothing reaches
+// os.Stderr or the log package.
+func TestOperatorCommandsShowNoArgumentTheyAreGiven(t *testing.T) {
+	const (
+		checkUsage           = "byward: usage: byward check --offline [-- stdio-upstream-command [args...]] (for the network checks, run byward doctor)\n"
+		doctorUsage          = "byward: usage: byward doctor [--json] [-- stdio-upstream-command [args...]]\n"
+		jwksUsage            = "byward: usage: byward jwks (prints the JWKS; redirect it to a file)\n"
+		downstreamTokenUsage = "byward: usage: byward downstream-token [--json] (run by a stdio upstream process or one of its descendants)\n"
+		storeMissingLine     = "byward: revoke-user: BYWARD_STORE_DIR" + storeMissing
+	)
+	coveredElsewhere := map[string]string{"init": "TestInitShowsAValueItWasGivenOnlyInTheScriptItPrints"}
+	processStderr := redirectStderr(t)
+	entraEnv, _, _ := operatorEnv(t, noStore)
+	oidcEnv := append(without(entraEnv, "BYWARD_ENTRA_"), "BYWARD_OIDC_CLIENT_SECRET_FILE="+setting(entraEnv, "BYWARD_ENTRA_CLIENT_SECRET_FILE"),
+		"BYWARD_IDP=keycloak", "BYWARD_OIDC_ISSUER=https://sso.example.com/realms/acme", "BYWARD_OIDC_CLIENT_ID=byward", "BYWARD_GATE_ALLOW_EMPTY=true")
+	refused := func(v string) string {
+		// The length is counted here, not by logging.NotShown, so a NotShown that showed part of v fails.
+		return fmt.Sprintf("byward: revoke-user (%d characters, not shown): %s\n", utf8.RuneCountInString(v), server.ErrNotAUserKey)
+	}
+	type cell struct {
+		place     string
+		want      string // stderr, exactly
+		args, env []string
+	}
+	placed := map[string]bool{}
+	run := func(t *testing.T, form string, cells []cell) {
+		for _, c := range cells {
+			placed[c.args[0]] = true
+			t.Run(c.place+"/"+form, func(t *testing.T) {
+				code, stdout, stderr := runWith(c.args, c.env...)
+				if shows(stderr) || shows(stdout) {
+					t.Errorf("exit %d; stdout %q, stderr %q show the value given", code, stdout, stderr)
+				}
+				if got := processStderr(t); got != "" {
+					t.Errorf("wrote %q to os.Stderr or the log package, want nothing", got)
+				}
+				if code != exitConfig || stdout != "" || stderr != c.want {
+					t.Errorf("exit %d, stdout %q, stderr %q; want exit %d and stderr %q", code, stdout, stderr, exitConfig, c.want)
+				}
+			})
+		}
+	}
+	usageCells := func(v string) []cell {
+		return []cell{
+			{"revoke-user, a second key", revokeUserUsage, []string{"revoke-user", "u1", v}, entraEnv},
+			{"revoke-all", revokeAllUsage, []string{"revoke-all", v}, entraEnv},
+			{"revoke-all --yes, then a value", revokeAllUsage, []string{"revoke-all", "--yes", v}, entraEnv},
+			{"store", newEpochUsage, []string{"store", v}, entraEnv},
+			{"store new-epoch, then a value", newEpochUsage, []string{"store", "new-epoch", v}, entraEnv},
+			{"store new-epoch --yes, then a value", newEpochUsage, []string{"store", "new-epoch", "--yes", v}, entraEnv},
+			{"check", checkUsage, []string{"check", v}, entraEnv},
+			{"check --offline, then a value", checkUsage, []string{"check", "--offline", v}, entraEnv},
+			{"doctor", doctorUsage, []string{"doctor", v}, entraEnv},
+			{"doctor --json, then a value", doctorUsage, []string{"doctor", "--json", v}, entraEnv},
+			{"jwks", jwksUsage, []string{"jwks", v}, entraEnv},
+			{"downstream-token", downstreamTokenUsage, []string{"downstream-token", v}, entraEnv},
+			{"downstream-token --json, then a value", downstreamTokenUsage, []string{"downstream-token", "--json", v}, entraEnv},
+		}
+	}
+	for _, form := range append(slices.Clone(secretForms), hostForm) {
+		v := form.value
+		run(t, form.name, append(usageCells(v),
+			cell{"revoke-user, oidc", storeMissingLine, []string{"revoke-user", v}, oidcEnv}))
+	}
+	for _, form := range tokenForms {
+		v := form.value
+		oidcWant := refused(v)
+		if form.subOK {
+			oidcWant = storeMissingLine
+		}
+		run(t, form.name, append(usageCells(v),
+			cell{"revoke-user, entra", refused(v), []string{"revoke-user", v}, entraEnv},
+			cell{"revoke-user, oidc", oidcWant, []string{"revoke-user", v}, oidcEnv}))
+	}
+	for name := range commands {
+		if !placed[name] && coveredElsewhere[name] == "" {
+			t.Errorf("operator command %q has no cell here: add one, or name the test that covers it", name)
+		}
 	}
 }

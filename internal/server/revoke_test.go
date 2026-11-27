@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"os"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/byward-dev/byward/internal/broker"
 	"github.com/byward-dev/byward/internal/config"
+	"github.com/byward-dev/byward/internal/logging"
 	"github.com/byward-dev/byward/internal/resource"
 	"github.com/byward-dev/byward/internal/store"
 	"github.com/byward-dev/byward/internal/store/sqlite"
@@ -245,16 +247,107 @@ func TestRevokeUserTakesAnOIDCSubjectAsItIs(t *testing.T) {
 			}
 		}
 	})
-	user, _, err := RevokeUser(context.Background(), cfg, discard, " f3a1-Alice ")
-	if err != nil || user != "f3a1-Alice" {
-		t.Fatalf("RevokeUser = %q, %v", user, err)
+	// What an operator pastes is trimmed: sign-in stores no subject with white space at either end.
+	for _, pasted := range []string{"f3a1-Alice\n", " f3a1-Alice "} {
+		if user, _, err := RevokeUser(context.Background(), cfg, discard, pasted); err != nil || user != "f3a1-Alice" {
+			t.Fatalf("RevokeUser(%q) = %q, %v; want f3a1-Alice", pasted, user, err)
+		}
 	}
 	if !grantGone(t, cfg, "alice") || grantGone(t, cfg, "other") {
 		t.Fatal("revoke-user must end exactly the grants of that subject")
 	}
-	for _, key := range []string{"  ", "alice\nbob", "a\x00b"} {
+	// The sub rule, not only the one every claim has: a sub is at most 255 ASCII characters.
+	for _, key := range []string{"  ", "alice\nbob", "a\x00b", strings.Repeat("a", 256), "ålice"} {
 		if _, _, err := RevokeUser(context.Background(), cfg, discard, key); !errors.Is(err, ErrNotAUserKey) {
 			t.Errorf("RevokeUser(%q) = %v, want ErrNotAUserKey", key, err)
 		}
+	}
+}
+
+// A token given to revoke-user as an oidc sub is within the sub rule, so it is taken as a user key
+// (#594): it revokes nobody, as no user signed in with it, and the audit record and every log line
+// name it only as [REDACTED]. A real user's grant beside it stays.
+func TestRevokeUserTakesATokenAsAnOIDCSubRevokesNobodyAndAuditsItRedacted(t *testing.T) {
+	const token = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJMSzdDQU5BUlkifQ.LK7CANARY"
+	cfg := loadOIDC(t, "keycloak", "https://sso.example.com/realms/acme", "c")
+	withStore(t, cfg, func(st *sqlite.Store) {
+		g := grantFor("held", time.Now().Add(-time.Minute))
+		g.Subject = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+		if _, err := st.CreateGrant(context.Background(), g); err != nil {
+			t.Fatal(err)
+		}
+	})
+	var logs bytes.Buffer
+	if user, _, err := RevokeUser(context.Background(), cfg, logging.New(&logs, "json"), token); err != nil || user != token {
+		t.Fatalf("RevokeUser(a token) = %q, %v; want it taken as a key", user, err)
+	}
+	if grantGone(t, cfg, "held") {
+		t.Fatal("another user's grant was revoked")
+	}
+	if strings.Contains(logs.String(), "LK7CANARY") || !strings.Contains(logs.String(), `"user_key":"[REDACTED]"`) {
+		t.Fatalf("the log shows the token, or does not audit it redacted: %s", logs.String())
+	}
+}
+
+// revoke-user revokes a user key however it is written, under any subject claim, so every user
+// sign-in stored stays revocable (#594). Through the real logger, the audit record names a
+// credential-shaped key (logging.LooksSecret, which also matches a name such as "Ann Basic Lee", a sub
+// such as eyJohn.Smith, or an email that happens to read like a token) as [REDACTED], and no other
+// attribute carries a piece of it of 4 or more characters (other than one the issuer's host holds, such
+// as example); any other key is named in full.
+func TestRevokeUserRevokesAKeyUnderAnySubjectClaimAndAuditsACredentialShapedOneRedacted(t *testing.T) {
+	for _, tc := range []struct {
+		claim, key string
+		redacted   bool
+	}{
+		{"sub", "eyJohn.Smith", true},
+		{"sub", "Basic x9Zq", true},
+		{"sub", "f47ac10b-58cc-4372-a567-0e02b2c3d479", false},
+		{"name", "Ann Basic Lee", true},
+		{"email", "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJMSzdDQU5BUlkifQ.LK7CANARY", true},
+		{"email", "heyJoe.Smith.Jr@example.com", true},
+		{"email", "jöhn@exämple.com", false},
+		{"name", "José", false},
+	} {
+		t.Run(tc.claim+"/"+tc.key, func(t *testing.T) {
+			cfg := loadOIDC(t, "keycloak", "https://sso.example.com/realms/acme", "c", "BYWARD_OIDC_SUBJECT_CLAIM="+tc.claim)
+			withStore(t, cfg, func(st *sqlite.Store) {
+				g := grantFor("held", time.Now().Add(-time.Minute))
+				g.Subject = tc.key
+				if _, err := st.CreateGrant(context.Background(), g); err != nil {
+					t.Fatal(err)
+				}
+			})
+			var logs bytes.Buffer
+			user, _, err := RevokeUser(context.Background(), cfg, logging.New(&logs, "json"), tc.key)
+			if err != nil || user != tc.key {
+				t.Fatalf("RevokeUser = %q, %v; want the key revoked as given", user, err)
+			}
+			if !grantGone(t, cfg, "held") {
+				t.Fatal("the user's grant is still there")
+			}
+			var record map[string]any
+			for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+				var r map[string]any
+				if json.Unmarshal([]byte(line), &r) == nil && r["event"] == "grant_revoked" {
+					record = r
+				}
+			}
+			want := tc.key
+			if tc.redacted {
+				want = "[REDACTED]"
+			}
+			if record == nil || record["user_key"] != want {
+				t.Fatalf("audit record %v; want user_key %q", record, want)
+			}
+			if !tc.redacted {
+				return
+			}
+			for _, part := range strings.FieldsFunc(tc.key, func(r rune) bool { return r == ' ' || r == '.' || r == '@' }) {
+				if len(part) >= 4 && !strings.Contains("https://sso.example.com/realms/acme", part) && strings.Contains(logs.String(), part) {
+					t.Errorf("the log holds %q, part of the key: %s", part, logs.String())
+				}
+			}
+		})
 	}
 }

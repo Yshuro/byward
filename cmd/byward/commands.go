@@ -109,12 +109,19 @@ func revokeUser(ctx context.Context, args, environ []string, stdout, stderr io.W
 	user, where, err := server.RevokeUser(ctx, cfg, logging.New(stderr, cfg.LogFormat), key)
 	switch {
 	case errors.Is(err, server.ErrNotAUserKey):
-		_, _ = fmt.Fprintf(stderr, "byward: revoke-user %q: %v\n", key, err)
+		_, _ = fmt.Fprintf(stderr, "byward: revoke-user %s: %v\n", logging.NotShown(key), err)
 		return exitConfig
 	case errors.As(err, new(server.ConfigError)):
 		return reportConfigError(stderr, err)
 	case err != nil:
 		return operatorFailure(stderr, "revoke-user", err)
+	}
+	if logging.LooksSecret(user) {
+		// A key shaped like a credential, under any subject claim (#594), is revoked, as it may be a real
+		// user's, but never shown, as it may be a token pasted in its place.
+		_, _ = fmt.Fprintf(stdout, "revoked user %s, a key that looks like a credential, in %s: their grants are gone and their tokens stop working within seconds\n", logging.NotShown(user), where)
+		_, _ = fmt.Fprintln(stdout, "if you pasted a token, it revoked nothing: no user has that key")
+		return exitOK
 	}
 	_, _ = fmt.Fprintf(stdout, "revoked user %s in %s: their grants are gone and their tokens stop working within seconds\n", user, where)
 	return exitOK

@@ -9,7 +9,6 @@ import (
 	"slices"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/byward-dev/byward/internal/apptoken"
 	"github.com/byward-dev/byward/internal/broker"
@@ -159,7 +158,7 @@ func newOIDCIdentityProvider(cfg *config.Config, idpHTTP *http.Client, redirect 
 		refused = &Warning{Message: "the client key signs with " + info.SigningAlgorithm() + ", which " + oidc.Presets[preset].Label +
 			" refuses for client assertions", Setting: keyAlgSetting, Fix: oidc.RefusedAssertionAdvice(info.SigningAlgorithm(), oidc.Presets[preset])}
 	}
-	ip := &identityProvider{name: cfg.IdP, redirect: redirect, label: oidcLabel(cfg), adapter: p, scope: p.Scope(), gateIdP: gate.Generic, userKey: oidcUserKey,
+	ip := &identityProvider{name: cfg.IdP, redirect: redirect, label: oidcLabel(cfg), adapter: p, scope: p.Scope(), gateIdP: gate.Generic, userKey: p.UserKey,
 		credentialDesc: credentialDesc,
 		diagnose: func(ctx context.Context, _ time.Time) []doctor.Result {
 			return append(diagnoseDiscovery(ctx, p, cfg.ShownIssuer(), loopbackHTTP), withCredential(p.DiagnoseClient(ctx, oidcDiagnosis(cfg)), credentialDesc, refused))
@@ -194,13 +193,6 @@ func withCredential(r doctor.Result, credentialDesc string, refused *Warning) do
 	}
 	r.Fix += warningFix(*refused)
 	return r
-}
-
-// oidcUserKey is an oidc subject as an operator gives it to revoke-user: exactly as the IdP sends it
-// (sub is case-sensitive), trimmed, never empty or with control characters.
-func oidcUserKey(s string) (string, bool) {
-	s = strings.TrimSpace(s)
-	return s, s != "" && !strings.ContainsFunc(s, unicode.IsControl)
 }
 
 // oidcLabel is BYWARD_OIDC_NAME, else the preset's name, else the issuer's host.

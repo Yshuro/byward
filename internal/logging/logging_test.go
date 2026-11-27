@@ -101,6 +101,10 @@ func TestOnlyCredentialShapedValuesAreRedacted(t *testing.T) {
 		"a JWT inside an error":                                   {value: errors.New("verify " + token + ": expired"), logged: redacted},
 		"a Stringer with a JWT":                                   {value: stringer("verify " + token), logged: redacted},
 		"an error with an eyJ identifier":                         {value: errors.New("unknown client dcr-eyJq0Z"), logged: "unknown client dcr-eyJq0Z"},
+		// User keys a real user may have, accepted over-redactions too (#594): revoke-user still takes them.
+		"a name with Basic in it":                 {value: "Ann Basic Lee", logged: redacted},
+		"a username shaped like a JWT":            {value: "eyJohn.Smith", logged: redacted},
+		"an email with eyJ and two dots after it": {value: "heyJoe.Smith.Jr@example.com", logged: redacted},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var buf bytes.Buffer
