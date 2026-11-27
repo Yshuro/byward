@@ -323,30 +323,42 @@ func TestRevokeCommandsExit2OnMisuseOrNoStore1OnAStoreFailureAndNameTheRevokedUs
 		name   string
 		args   []string
 		store  operatorStore
+		oidc   bool
 		code   int
 		stdout string // the whole stdout: the store by its setting, never its path (#575)
 		stderr string // the whole stderr of a command that is not done; "" for a done one
 	}{
-		{"revoke-user without a key", []string{"revoke-user"}, noStore, exitConfig, "", revokeUserUsage},
-		{"revoke-user with two keys", []string{"revoke-user", user, user}, noStore, exitConfig, "", revokeUserUsage},
-		{"revoke-user with an email", []string{"revoke-user", "alice@contoso.example"}, noStore, exitConfig, "", `byward: revoke-user (21 characters, not shown): not a user key: with Entra, tid:oid, the tenant and object IDs of the user; with an oidc IdP, the value of its subject claim (BYWARD_OIDC_SUBJECT_CLAIM, default sub; a sub is at most 255 printable ASCII characters), as the audit records' user_key shows it` + "\n"},
-		{"revoke-user with an empty key", []string{"revoke-user", ""}, noStore, exitConfig, "", `byward: revoke-user (0 characters, not shown): not a user key: with Entra, tid:oid, the tenant and object IDs of the user; with an oidc IdP, the value of its subject claim (BYWARD_OIDC_SUBJECT_CLAIM, default sub; a sub is at most 255 printable ASCII characters), as the audit records' user_key shows it` + "\n"},
-		{"revoke-user with a non-ASCII email, named by its characters, not bytes", []string{"revoke-user", "jöhn@exämple.com"}, noStore, exitConfig, "", `byward: revoke-user (16 characters, not shown): not a user key: with Entra, tid:oid, the tenant and object IDs of the user; with an oidc IdP, the value of its subject claim (BYWARD_OIDC_SUBJECT_CLAIM, default sub; a sub is at most 255 printable ASCII characters), as the audit records' user_key shows it` + "\n"},
-		{"revoke-all without --yes", []string{"revoke-all"}, noStore, exitConfig, "", revokeAllUsage},
-		{"revoke-all with yes instead of --yes", []string{"revoke-all", "yes"}, noStore, exitConfig, "", revokeAllUsage},
-		{"revoke-all with --yes and more", []string{"revoke-all", "--yes", "extra"}, noStore, exitConfig, "", revokeAllUsage},
-		{"revoke-user with no store", []string{"revoke-user", user}, noStore, exitConfig, "", "byward: revoke-user: BYWARD_STORE_DIR" + storeMissing},
-		{"revoke-all with no store", []string{"revoke-all", "--yes"}, noStore, exitConfig, "", "byward: revoke-all: BYWARD_STORE_DIR" + storeMissing},
-		{"revoke-user with a state directory that is a file", []string{"revoke-user", user}, stateDirIsAFile, exitConfig, "", "byward: revoke-user: BYWARD_STORE_DIR" + stateDirNotADir},
-		{"revoke-all with a state directory that is a file", []string{"revoke-all", "--yes"}, stateDirIsAFile, exitConfig, "", "byward: revoke-all: BYWARD_STORE_DIR" + stateDirNotADir},
-		{"revoke-user with a store that cannot open", []string{"revoke-user", user}, corruptStore, exitRuntime, "", "byward: revoke-user failed: " + storeCannotOpen},
-		{"revoke-all with a store that cannot open", []string{"revoke-all", "--yes"}, corruptStore, exitRuntime, "", "byward: revoke-all failed: " + storeCannotOpen},
-		{"revoke-user", []string{"revoke-user", strings.ToUpper(user)}, proxysStore, exitOK, "revoked user " + user + " in BYWARD_STORE_DIR" + revoked, ""},
-		{"revoke-all", []string{"revoke-all", "--yes"}, proxysStore, exitOK, "revoked every user in BYWARD_STORE_DIR" + revoked, ""},
+		{"revoke-user without a key", []string{"revoke-user"}, noStore, false, exitConfig, "", revokeUserUsage},
+		{"revoke-user with two keys", []string{"revoke-user", user, user}, noStore, false, exitConfig, "", revokeUserUsage},
+		{"revoke-user with an email", []string{"revoke-user", "alice@contoso.example"}, noStore, false, exitConfig, "", `byward: revoke-user (21 characters, not shown): not a user key: with Entra, tid:oid, the tenant and object IDs of the user; with an oidc IdP, the value of its subject claim (BYWARD_OIDC_SUBJECT_CLAIM, default sub; a sub is at most 255 printable ASCII characters), as the audit records' user_key shows it` + "\n"},
+		{"revoke-user with an empty key", []string{"revoke-user", ""}, noStore, false, exitConfig, "", `byward: revoke-user (0 characters, not shown): not a user key: with Entra, tid:oid, the tenant and object IDs of the user; with an oidc IdP, the value of its subject claim (BYWARD_OIDC_SUBJECT_CLAIM, default sub; a sub is at most 255 printable ASCII characters), as the audit records' user_key shows it` + "\n"},
+		{"revoke-user with a non-ASCII email, named by its characters, not bytes", []string{"revoke-user", "jöhn@exämple.com"}, noStore, false, exitConfig, "", `byward: revoke-user (16 characters, not shown): not a user key: with Entra, tid:oid, the tenant and object IDs of the user; with an oidc IdP, the value of its subject claim (BYWARD_OIDC_SUBJECT_CLAIM, default sub; a sub is at most 255 printable ASCII characters), as the audit records' user_key shows it` + "\n"},
+		{"revoke-all without --yes", []string{"revoke-all"}, noStore, false, exitConfig, "", revokeAllUsage},
+		{"revoke-all with yes instead of --yes", []string{"revoke-all", "yes"}, noStore, false, exitConfig, "", revokeAllUsage},
+		{"revoke-all with --yes and more", []string{"revoke-all", "--yes", "extra"}, noStore, false, exitConfig, "", revokeAllUsage},
+		{"revoke-user with no store", []string{"revoke-user", user}, noStore, false, exitConfig, "", "byward: revoke-user: BYWARD_STORE_DIR" + storeMissing},
+		{"revoke-all with no store", []string{"revoke-all", "--yes"}, noStore, false, exitConfig, "", "byward: revoke-all: BYWARD_STORE_DIR" + storeMissing},
+		{"revoke-user with a state directory that is a file", []string{"revoke-user", user}, stateDirIsAFile, false, exitConfig, "", "byward: revoke-user: BYWARD_STORE_DIR" + stateDirNotADir},
+		{"revoke-all with a state directory that is a file", []string{"revoke-all", "--yes"}, stateDirIsAFile, false, exitConfig, "", "byward: revoke-all: BYWARD_STORE_DIR" + stateDirNotADir},
+		{"revoke-user with a store that cannot open", []string{"revoke-user", user}, corruptStore, false, exitRuntime, "", "byward: revoke-user failed: " + storeCannotOpen},
+		{"revoke-all with a store that cannot open", []string{"revoke-all", "--yes"}, corruptStore, false, exitRuntime, "", "byward: revoke-all failed: " + storeCannotOpen},
+		{"revoke-user", []string{"revoke-user", strings.ToUpper(user)}, proxysStore, false, exitOK, "revoked user " + user + " in BYWARD_STORE_DIR" + revoked, ""},
+		{"revoke-user with bidi key", []string{"revoke-user", "al\u202eice@example.com"}, proxysStore, true, exitOK, `revoked user "al\u202eice@example.com" in BYWARD_STORE_DIR` + revoked, ""},
+		{"revoke-all", []string{"revoke-all", "--yes"}, proxysStore, false, exitOK, "revoked every user in BYWARD_STORE_DIR" + revoked, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			env, stateDir, counter := operatorEnv(t, tc.store)
+			if tc.oidc {
+				env = append(without(env, "BYWARD_ENTRA_"),
+					"BYWARD_OIDC_CLIENT_SECRET_FILE="+setting(env, "BYWARD_ENTRA_CLIENT_SECRET_FILE"),
+					"BYWARD_IDP=keycloak",
+					"BYWARD_OIDC_ISSUER=https://sso.example.com/realms/acme",
+					"BYWARD_OIDC_CLIENT_ID=byward",
+					"BYWARD_OIDC_SUBJECT_CLAIM=email",
+					"BYWARD_GATE_ALLOW_EMPTY=true",
+				)
+			}
 			code, stdout, stderr := runWith(tc.args, env...)
 			wantStdout := tc.stdout
 			var wantStderr string

@@ -9,7 +9,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"unicode"
 
 	"github.com/byward-dev/byward/internal/config"
 	"github.com/byward-dev/byward/internal/logging"
@@ -129,12 +128,12 @@ func revokeUser(ctx context.Context, args, environ []string, stdout, stderr io.W
 	return exitOK
 }
 
-// formatUserKey quotes a user key on operator output when it contains a Unicode format character
-// (Cf, e.g. bidi overrides or zero-width spaces) or any non-printable rune, preventing terminal
-// display spoofing.
+// formatUserKey quotes a user key on operator output when it contains any rune rejected by
+// strconv.IsPrint (which covers Unicode format characters, Cf, e.g. bidi overrides or zero-width
+// spaces, as well as control characters), preventing terminal display spoofing.
 func formatUserKey(user string) string {
 	for _, r := range user {
-		if unicode.Is(unicode.Cf, r) || !strconv.IsPrint(r) {
+		if !strconv.IsPrint(r) {
 			return fmt.Sprintf("%q", user)
 		}
 	}
