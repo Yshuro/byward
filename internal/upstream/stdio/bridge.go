@@ -124,6 +124,9 @@ func (b *Bridge) post(w http.ResponseWriter, r *http.Request, id Identity, key s
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return
 		}
+		if shutdown.AnswerIfEnded(w, r) { // the read failed as its MCP client went away, or at shutdown (#672)
+			return
+		}
 		http.Error(w, "cannot read the request body", http.StatusBadRequest)
 		return
 	}
@@ -145,7 +148,7 @@ func (b *Bridge) post(w http.ResponseWriter, r *http.Request, id Identity, key s
 	}
 	if key == "" {
 		if env.Method != "initialize" || env.kind() != kindRequest {
-			legacyFallback(w)
+			legacyFallback(w, r)
 			return
 		}
 		if s, release = b.start(w, r, id); s == nil {

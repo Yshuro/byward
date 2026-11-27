@@ -28,10 +28,7 @@ type stdioCell struct {
 	closes bool     // the answer closes its connection
 	warns  []string // every WARN or ERROR line, by message, in any order, but a crash's
 	alive  bool     // the cell's process outlives the request, with its MCP session (legacy) or userConn (modern)
-	// crash is a cell whose process is killed. Its exit is logged as unexpected, at WARN, unless
-	// its stdout's end reached the bridge first: then it is logged as a stop for stdout_closed, at
-	// INFO (crashLogged).
-	crash bool
+	crash  bool     // the cell's process is killed: its exit is logged once, as unexpected, at WARN, and nothing stops it
 }
 
 // stdioRig is one bridge serving through logging.Middleware, as the server does, so a cell sees the
@@ -223,22 +220,14 @@ func (r *stdioRig) check(t *testing.T, w *brokenWriter, done <-chan struct{}, wa
 	}
 }
 
-// crashLogged fails t unless the killed process's exit was logged once: as an unexpected exit,
-// or, when its stdout's end reached the bridge before the exit was reaped, as a stop for
-// stdout_closed and an expected exit. Which one is a race today: the cells are KnownResidual("#672")
-// (crashRace) until the fix logs both as unexpected.
+// crashLogged fails t unless the killed process's exit was logged once, as unexpected, and no stop:
+// a crashed process is reaped before the stdout_closed stop's grace (process.go) runs out.
 func (r *stdioRig) crashLogged(t *testing.T) {
 	t.Helper()
 	eventually(t, "the process's exit to be logged", func() bool {
 		return len(r.log.with(exited))+len(r.log.with("upstream process exited")) == 1
 	})
-	if len(r.log.with(exited)) == 1 {
-		r.log.wantLoggedAsCrash(t)
-		return
-	}
-	if stops := r.log.with("stopping upstream process"); len(stops) != 1 || stops[0].attrs["reason"] != "stdout_closed" {
-		t.Errorf("the killed process's exit was logged as expected, with stops %v; want it logged as unexpected, or stopped for stdout_closed", stops)
-	}
+	r.log.wantLoggedAsCrash(t)
 }
 
 // stopping reports whether a process byward is stopping has not exited yet.
@@ -296,7 +285,6 @@ const (
 	sessionGone  = "session not found"
 	unavailable  = "upstream unavailable"
 	processEnded = `"code":-32603`
-	cannotRead   = "cannot read the request body"
 )
 
 // bigInitialize and bigRequest are larger than any pipe buffer, and smaller than what fakestdio
@@ -370,9 +358,6 @@ const (
 	noWriteBound     = "the only bound on a started stream is writeTimeout, 30 s of real time through SetWriteDeadline (sse.go), which the fake clock does not reach; a write that fails is the client-gone cell (TestAStdioStreamEndedByItsRequestIsRecordedAsCutOff, keep-alive row), and sse_test.go pins the deadline"
 	noAnswerBound    = "nothing bounds the wait for the process's answer: a held lease stops the idle timer (Process.hold), and a request lease is never evicted; the client leaving or a shutdown ends the wait"
 	noBodyBound      = "the bridge sets no bound on reading or sending a request: Send waits on its request alone, and the server's ReadTimeout bounds a stalled body"
-	crashRace        = "a killed process's exit is logged as unexpected, at WARN, only if it is reaped before the bridge reads its stdout's end; else the bridge stops it for stdout_closed and its exit is logged at INFO (process.go wait), so an operator loses a crash's warning; the cell accepts either until the fix makes it strict"
-	probeBug         = "a modern request whose MCP client goes away, or the proxy shuts down, while the server/discover probe is out waits for the probe's answer (it runs on its own context, as its verdict is shared), and if the upstream proves legacy is answered 400 legacyFallback (modern.go modernPost), not by how it ended"
-	bodyReadBug      = "a request whose MCP client goes away, or the proxy shuts down, while the bridge reads its body is answered 400 \"cannot read the request body\" (bridge.go post), not by how it ended (shutdown.AnswerIfEnded): 499, or 503 and close"
 )
 
 // unreachableColumns marks the columns no stdio transport has.
@@ -407,16 +392,24 @@ func legacyInitializeMatrix() map[lifecycle.Cell]lifecycle.Case {
 	unreachableColumns(m)
 	for _, end := range []lifecycle.Ending{lifecycle.ClientGone, lifecycle.Shutdown} {
 		m[at(end, lifecycle.NotStarted)] = lifecycle.Pinned(func(t *testing.T) {
-			r := newStdioRig(t, nil)
-			ctx, stop := endedAs(end).Start(context.Background())
-			stop()
-			w, done := r.start(ctx, http.MethodPost, "", strings.NewReader(initialize))
-			r.check(t, w, done, endedCell(end, false))
+			for name, body := range map[string]string{
+				"an initialize": initialize,
+				// not legacyFallback's 400: a legacy request with no MCP session is told to initialize
+				"a request without an MCP session": `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`,
+			} {
+				t.Run(name, func(t *testing.T) {
+					r := newStdioRig(t, nil)
+					ctx, stop := endedAs(end).Start(context.Background())
+					stop()
+					w, done := r.start(ctx, http.MethodPost, "", strings.NewReader(body))
+					r.check(t, w, done, endedCell(end, false))
+				})
+			}
 		})
-		m[at(end, lifecycle.BodyInFlight)] = lifecycle.KnownResidual("#672", bodyReadBug, func(t *testing.T) {
+		m[at(end, lifecycle.BodyInFlight)] = lifecycle.Pinned(func(t *testing.T) {
 			t.Run("its body is read", func(t *testing.T) {
 				r := newStdioRig(t, nil)
-				r.bodyCut(t, end, "", initialize, stdioCell{status: http.StatusBadRequest, body: cannotRead})
+				r.bodyCut(t, end, "", initialize, endedCell(end, false))
 			})
 			t.Run("it is sent", func(t *testing.T) { // the process stops: initialize_failed
 				r := newStdioRig(t, nil, "-init=block")
@@ -454,7 +447,7 @@ func legacyInitializeMatrix() map[lifecycle.Cell]lifecycle.Case {
 		_ = pw.Close()
 		r.check(t, w, done, stdioCell{status: http.StatusOK, body: `"protocolVersion"`, alive: true})
 	})
-	m[at(lifecycle.UpstreamGone, lifecycle.BodyInFlight)] = lifecycle.KnownResidual("#672", crashRace, func(t *testing.T) {
+	m[at(lifecycle.UpstreamGone, lifecycle.BodyInFlight)] = lifecycle.Pinned(func(t *testing.T) {
 		r := newStdioRig(t, nil, "-init=block")
 		r.stdinFull(t, lifecycle.UpstreamGone, "", bigInitialize, func() {}, func() {},
 			stdioCell{status: http.StatusBadGateway, body: unavailable, warns: []string{initFailed}, crash: true})
@@ -467,7 +460,7 @@ func legacyInitializeMatrix() map[lifecycle.Cell]lifecycle.Case {
 		r.signal(t, syscall.SIGUSR1)
 		r.check(t, w, done, stdioCell{status: http.StatusOK, body: `"protocolVersion"`, alive: true})
 	})
-	m[at(lifecycle.UpstreamGone, lifecycle.AwaitingHeaders)] = lifecycle.KnownResidual("#672", crashRace, func(t *testing.T) {
+	m[at(lifecycle.UpstreamGone, lifecycle.AwaitingHeaders)] = lifecycle.Pinned(func(t *testing.T) {
 		r := newStdioRig(t, nil, "-init=hold")
 		w, done := r.start(context.Background(), http.MethodPost, "", strings.NewReader(initialize))
 		r.saidOnStderr(t, "holding initialize")
@@ -482,7 +475,7 @@ func legacyInitializeMatrix() map[lifecycle.Cell]lifecycle.Case {
 		r.signal(t, syscall.SIGUSR1)
 		r.check(t, w, done, stdioCell{status: http.StatusOK, body: `"protocolVersion"`, alive: true})
 	})
-	m[at(lifecycle.UpstreamGone, lifecycle.Streaming)] = lifecycle.KnownResidual("#672", crashRace, func(t *testing.T) {
+	m[at(lifecycle.UpstreamGone, lifecycle.Streaming)] = lifecycle.Pinned(func(t *testing.T) {
 		r := newStdioRig(t, nil, "-init=lognhold")
 		w, done := r.start(context.Background(), http.MethodPost, "", strings.NewReader(initialize))
 		eventually(t, "the notification", func() bool { return strings.Contains(w.written(), "notifications/message") })
@@ -498,9 +491,7 @@ func legacyInitializeMatrix() map[lifecycle.Cell]lifecycle.Case {
 func (r *stdioRig) session(t *testing.T) string {
 	t.Helper()
 	sid := r.initialize(t, "alice")
-	r.log.mu.Lock()
-	*r.log.recs = (*r.log.recs)[:0]
-	r.log.mu.Unlock()
+	r.log.setAside()
 	return sid
 }
 
@@ -527,11 +518,11 @@ func legacyRequestMatrix() map[lifecycle.Cell]lifecycle.Case {
 			w, done := r.start(ctx, http.MethodPost, sid, strings.NewReader(toolsList))
 			r.check(t, w, done, endedCell(end, true))
 		})
-		m[at(end, lifecycle.BodyInFlight)] = lifecycle.KnownResidual("#672", bodyReadBug, func(t *testing.T) {
+		m[at(end, lifecycle.BodyInFlight)] = lifecycle.Pinned(func(t *testing.T) {
 			t.Run("its body is read", func(t *testing.T) {
 				r := newStdioRig(t, nil)
 				sid := r.session(t)
-				r.bodyCut(t, end, sid, toolsList, stdioCell{status: http.StatusBadRequest, body: cannotRead, alive: true})
+				r.bodyCut(t, end, sid, toolsList, endedCell(end, true))
 			})
 			t.Run("it is sent", func(t *testing.T) { // a message cut short stops the process: partial_write
 				r := newStdioRig(t, nil)
@@ -550,7 +541,7 @@ func legacyRequestMatrix() map[lifecycle.Cell]lifecycle.Case {
 			r.check(t, w, done, cutCell(end, true))
 		})
 	}
-	m[at(lifecycle.UpstreamGone, lifecycle.NotStarted)] = lifecycle.KnownResidual("#672", crashRace, func(t *testing.T) {
+	m[at(lifecycle.UpstreamGone, lifecycle.NotStarted)] = lifecycle.Pinned(func(t *testing.T) {
 		r := newStdioRig(t, nil)
 		sid := r.session(t)
 		r.crashed(t)
@@ -566,7 +557,7 @@ func legacyRequestMatrix() map[lifecycle.Cell]lifecycle.Case {
 		_ = pw.Close()
 		r.check(t, w, done, stdioCell{status: http.StatusOK, body: `"id":2`, alive: true})
 	})
-	m[at(lifecycle.UpstreamGone, lifecycle.BodyInFlight)] = lifecycle.KnownResidual("#672", crashRace, func(t *testing.T) {
+	m[at(lifecycle.UpstreamGone, lifecycle.BodyInFlight)] = lifecycle.Pinned(func(t *testing.T) {
 		r := newStdioRig(t, nil)
 		sid := r.session(t)
 		r.stdinFull(t, lifecycle.UpstreamGone, sid, bigRequest, func() { r.signal(t, syscall.SIGSTOP) }, func() {}, sessionGoneCell)
@@ -587,7 +578,7 @@ func legacyRequestMatrix() map[lifecycle.Cell]lifecycle.Case {
 		}
 		r.check(t, w, done, stdioCell{status: http.StatusOK, body: `"released"`, alive: true})
 	})
-	m[at(lifecycle.UpstreamGone, lifecycle.Streaming)] = lifecycle.KnownResidual("#672", crashRace, func(t *testing.T) {
+	m[at(lifecycle.UpstreamGone, lifecycle.Streaming)] = lifecycle.Pinned(func(t *testing.T) {
 		r := newStdioRig(t, nil)
 		sid := r.session(t)
 		w, done := r.start(context.Background(), http.MethodPost, sid, strings.NewReader(holdBody))
@@ -626,7 +617,7 @@ func legacyGETMatrix() map[lifecycle.Cell]lifecycle.Case {
 			r.check(t, w, done, cutCell(end, true))
 		})
 	}
-	m[at(lifecycle.UpstreamGone, lifecycle.NotStarted)] = lifecycle.KnownResidual("#672", crashRace, func(t *testing.T) {
+	m[at(lifecycle.UpstreamGone, lifecycle.NotStarted)] = lifecycle.Pinned(func(t *testing.T) {
 		r := newStdioRig(t, nil)
 		sid := r.session(t)
 		r.crashed(t)
@@ -644,7 +635,7 @@ func legacyGETMatrix() map[lifecycle.Cell]lifecycle.Case {
 	})
 	// The crash is logged by the process (exited); the GET carries no answer to cut, so it ends as
 	// a DELETE's does, with no error_type.
-	m[at(lifecycle.UpstreamGone, lifecycle.Streaming)] = lifecycle.KnownResidual("#672", crashRace, func(t *testing.T) {
+	m[at(lifecycle.UpstreamGone, lifecycle.Streaming)] = lifecycle.Pinned(func(t *testing.T) {
 		r := newStdioRig(t, nil)
 		sid := r.session(t)
 		w, done := r.start(context.Background(), http.MethodGet, sid, http.NoBody)
@@ -686,9 +677,7 @@ func (r *stdioRig) warm(t *testing.T) {
 		t.Fatalf("first modern request: status %d", res.StatusCode)
 	}
 	readEvents(t, res)
-	r.log.mu.Lock()
-	*r.log.recs = (*r.log.recs)[:0]
-	r.log.mu.Unlock()
+	r.log.setAside()
 }
 
 // cancelledUpstream waits until the upstream has seen the cell's request cancelled.
@@ -707,16 +696,33 @@ func modernRequestMatrix() map[lifecycle.Cell]lifecycle.Case {
 	bigEcho := modernBody(`1`, "echo", "", `"pad":"`+strings.Repeat("a", 512<<10)+`"`)
 	for _, end := range []lifecycle.Ending{lifecycle.ClientGone, lifecycle.Shutdown} {
 		m[at(end, lifecycle.NotStarted)] = lifecycle.Pinned(func(t *testing.T) {
-			r := newModernRig(t, nil, "-modern")
-			ctx, stop := endedAs(end).Start(context.Background())
-			stop()
-			w, done := r.modernStart(ctx, echo)
-			r.check(t, w, done, endedCell(end, false))
+			t.Run("the upstream's era not yet known", func(t *testing.T) {
+				r := newModernRig(t, nil, "-modern")
+				ctx, stop := endedAs(end).Start(context.Background())
+				stop()
+				w, done := r.modernStart(ctx, echo)
+				r.check(t, w, done, endedCell(end, false))
+			})
+			t.Run("the upstream already known to be legacy", func(t *testing.T) { // not legacyFallback's 400 (modernPost's cached verdict)
+				r := newModernRig(t, nil, "-mcp")
+				if res := r.modern(t, "alice", echo); res.StatusCode != http.StatusBadRequest {
+					t.Fatalf("the first modern request to a legacy upstream: status %d, want 400", res.StatusCode)
+				}
+				eventually(t, "the legacy process to stop", func() bool { return r.held() == held{} })
+				if !r.bridge.cap.legacy() {
+					t.Fatal("the legacy verdict was not kept: the cell would not reach modernPost's cached verdict")
+				}
+				r.log.setAside()
+				ctx, stop := endedAs(end).Start(context.Background())
+				stop()
+				w, done := r.modernStart(ctx, echo)
+				r.check(t, w, done, endedCell(end, false))
+			})
 		})
-		m[at(end, lifecycle.BodyInFlight)] = lifecycle.KnownResidual("#672", bodyReadBug, func(t *testing.T) {
+		m[at(end, lifecycle.BodyInFlight)] = lifecycle.Pinned(func(t *testing.T) {
 			t.Run("its body is read", func(t *testing.T) {
 				r := newModernRig(t, nil, "-modern")
-				r.bodyCut(t, end, "", echo, stdioCell{status: http.StatusBadRequest, body: cannotRead}, modernHeaders(echo)...)
+				r.bodyCut(t, end, "", echo, endedCell(end, false), modernHeaders(echo)...)
 			})
 			t.Run("it is sent", func(t *testing.T) { // a message cut short stops the shared process: partial_write
 				r := newModernRig(t, nil, "-modern")
@@ -724,7 +730,7 @@ func modernRequestMatrix() map[lifecycle.Cell]lifecycle.Case {
 				r.stdinFull(t, end, "", bigEcho, func() { r.signal(t, syscall.SIGSTOP) }, func() { r.signal(t, syscall.SIGCONT) }, endedCell(end, false), modernHeaders(bigEcho)...)
 			})
 		})
-		m[at(end, lifecycle.AwaitingHeaders)] = lifecycle.KnownResidual("#672", probeBug, func(t *testing.T) {
+		m[at(end, lifecycle.AwaitingHeaders)] = lifecycle.Pinned(func(t *testing.T) {
 			t.Run("the upstream proves modern", func(t *testing.T) {
 				r := newModernRig(t, nil, "-holddiscover", "-modern")
 				ctx, stop := endedAs(end).Start(context.Background())
@@ -734,14 +740,17 @@ func modernRequestMatrix() map[lifecycle.Cell]lifecycle.Case {
 				r.signal(t, syscall.SIGUSR1)
 				r.check(t, w, done, endedCell(end, true))
 			})
-			t.Run("the upstream proves legacy", func(t *testing.T) { // the residual: legacyFallback's 400
+			t.Run("the upstream proves legacy", func(t *testing.T) { // not legacyFallback's 400; its process stops: not_modern
 				r := newModernRig(t, nil, "-mcp", "-invaliddiscover", "-holddiscover")
 				ctx, stop := endedAs(end).Start(context.Background())
 				w, done := r.modernStart(ctx, echo)
 				r.saidOnStderr(t, "holding discover")
 				r.end(end, stop)
 				r.signal(t, syscall.SIGUSR1)
-				r.check(t, w, done, stdioCell{status: http.StatusBadRequest, body: "speaks MCP 2025-11-25"})
+				r.check(t, w, done, endedCell(end, false))
+				if n := r.stops("not_modern"); n != 1 {
+					t.Errorf("%d not_modern stops; want the legacy process stopped once", n)
+				}
 			})
 		})
 		m[at(end, lifecycle.Streaming)] = lifecycle.Pinned(func(t *testing.T) { // cancelled upstream too
@@ -768,7 +777,7 @@ func modernRequestMatrix() map[lifecycle.Cell]lifecycle.Case {
 		_ = pw.Close()
 		r.check(t, w, done, stdioCell{status: http.StatusOK, body: `"lifecycle"`, alive: true})
 	})
-	m[at(lifecycle.UpstreamGone, lifecycle.BodyInFlight)] = lifecycle.KnownResidual("#672", crashRace, func(t *testing.T) {
+	m[at(lifecycle.UpstreamGone, lifecycle.BodyInFlight)] = lifecycle.Pinned(func(t *testing.T) {
 		r := newModernRig(t, nil, "-modern")
 		r.warm(t)
 		r.stdinFull(t, lifecycle.UpstreamGone, "", bigEcho, func() { r.signal(t, syscall.SIGSTOP) }, func() {},
@@ -782,7 +791,7 @@ func modernRequestMatrix() map[lifecycle.Cell]lifecycle.Case {
 		r.signal(t, syscall.SIGUSR1)
 		r.check(t, w, done, stdioCell{status: http.StatusOK, body: `"lifecycle"`, alive: true})
 	})
-	m[at(lifecycle.UpstreamGone, lifecycle.AwaitingHeaders)] = lifecycle.KnownResidual("#672", crashRace, func(t *testing.T) {
+	m[at(lifecycle.UpstreamGone, lifecycle.AwaitingHeaders)] = lifecycle.Pinned(func(t *testing.T) {
 		r := newModernRig(t, nil, "-exitondiscover", "-modern")
 		w, done := r.modernStart(context.Background(), echo)
 		r.check(t, w, done, stdioCell{status: http.StatusBadGateway, body: unavailable, warns: []string{relayFailed}, crash: true})
@@ -805,7 +814,7 @@ func modernRequestMatrix() map[lifecycle.Cell]lifecycle.Case {
 		readEvents(t, r.modern(t, "alice", modernBody(`"r"`, "release", "", "")))
 		r.check(t, w, done, stdioCell{status: http.StatusOK, body: `"released"`, alive: true})
 	})
-	m[at(lifecycle.UpstreamGone, lifecycle.Streaming)] = lifecycle.KnownResidual("#672", crashRace, func(t *testing.T) {
+	m[at(lifecycle.UpstreamGone, lifecycle.Streaming)] = lifecycle.Pinned(func(t *testing.T) {
 		r := newModernRig(t, nil, "-modern")
 		w, done := r.modernStart(context.Background(), hold)
 		eventually(t, "the stream to start", w.hasStarted)
@@ -859,7 +868,7 @@ func modernListenMatrix() map[lifecycle.Cell]lifecycle.Case {
 		r.check(t, w, done, stdioCell{status: http.StatusOK, body: completeResult, alive: true})
 		r.cancelledUpstream(t)
 	})
-	m[at(lifecycle.UpstreamGone, lifecycle.Streaming)] = lifecycle.KnownResidual("#672", crashRace, func(t *testing.T) {
+	m[at(lifecycle.UpstreamGone, lifecycle.Streaming)] = lifecycle.Pinned(func(t *testing.T) {
 		r := newModernRig(t, nil, "-modern")
 		w, done := open(t, r, context.Background())
 		r.signal(t, syscall.SIGKILL)
