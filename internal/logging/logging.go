@@ -163,7 +163,19 @@ func describe(v any, text func() string) (s string) {
 // segment after eyJ ends in a dot, or at the end of a string cut short (stderr lines are, at
 // MaxStderrLine). A random base64url identifier has no dots, so it never matches, however often it
 // happens to contain eyJ.
-var jwtShape = regexp.MustCompile(`eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*(?:\.|$)|[A-Za-z0-9_-]\.eyJ[A-Za-z0-9_-]*(?:\.|$)`)
+var jwtShape = regexp.MustCompile(jwtHeader + "|" + jwtPayload)
+
+// jwtHeader and jwtPayload are jwtShape's two alternatives: a segment starting eyJ that ends in a
+// dot, and a dot before a segment starting eyJ.
+const (
+	jwtHeader  = `eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*(?:\.|$)`
+	jwtPayload = `[A-Za-z0-9_-]\.eyJ[A-Za-z0-9_-]*(?:\.|$)`
+)
+
+// jwtWord is jwtHeader starting a word, so a host such as heyJude.example is no JWT; the redactor
+// keeps jwtShape, which also hides an eyJ inside a word (heyJoe.Smith.Jr@…). A JWS whose header
+// does not start eyJ is still found: its payload starts eyJ after a dot, and ends in one.
+var jwtWord = regexp.MustCompile(`(?:^|[^A-Za-z0-9])` + jwtHeader)
 
 // authScheme is an HTTP Bearer or Basic credential: the scheme, in any case, then whitespace and
 // the credential. The scheme must not follow _, so an auth method name such as client_secret_basic
@@ -180,6 +192,13 @@ var authScheme = regexp.MustCompile(`(?i)(?:^|[^_])(?:bearer|basic)\s+\S`)
 func LooksSecret(s string) bool {
 	return authScheme.MatchString(s) || jwtShape.MatchString(s)
 }
+
+// HoldsJWT reports whether s holds a compact JWS or JWE: a segment starting eyJ at the start of a
+// word, then a dot (jwtWord). It is the narrower JWT shape that a value may be refused by:
+// LooksSecret's Bearer and Basic rule matches everyday wording ("Basic tier"), and jwtShape an eyJ
+// inside a word (heyJude.example). Prose still matches it where a word starts eyJ and a dot follows:
+// eyJohn.Smith, ann.eyJones.x.
+func HoldsJWT(s string) bool { return jwtWord.MatchString(s) }
 
 type ctxKey struct{}
 
