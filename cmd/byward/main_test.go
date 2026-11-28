@@ -333,7 +333,7 @@ func TestRevokeCommandsExit2OnMisuseOrNoStore1OnAStoreFailureAndNameTheRevokedUs
 		{"revoke-user --yes", []string{"revoke-user", "--yes"}, noStore, exitConfig, "", revokeUserUsage},
 		{"revoke-user -x", []string{"revoke-user", "-x"}, noStore, exitConfig, "", revokeUserUsage},
 		{"revoke-user -- -odd-key", []string{"revoke-user", "--", "-odd-key"}, noStore, exitConfig, "", revokeUserUsage},
-		{"revoke-user --key=-odd-key", []string{"revoke-user", "--key=-odd-key"}, noStore, exitConfig, "", `byward: revoke-user "-odd-key": not a user key: with Entra, tid:oid, the tenant and object IDs of the user; with an oidc IdP, the value of its subject claim (BYWARD_OIDC_SUBJECT_CLAIM, default sub), as the audit records' user_key shows it` + "\n"},
+		{"revoke-user --key=-odd-key", []string{"revoke-user", "--key=-odd-key"}, noStore, exitConfig, "", `byward: revoke-user (8 characters, not shown): not a user key: with Entra, tid:oid, the tenant and object IDs of the user; with an oidc IdP, the value of its subject claim (BYWARD_OIDC_SUBJECT_CLAIM, default sub; a sub is at most 255 printable ASCII characters), as the audit records' user_key shows it` + "\n"},
 		{"revoke-user with two keys", []string{"revoke-user", user, user}, noStore, exitConfig, "", revokeUserUsage},
 		{"revoke-user with an email", []string{"revoke-user", "alice@contoso.example"}, noStore, exitConfig, "", `byward: revoke-user (21 characters, not shown): not a user key: with Entra, tid:oid, the tenant and object IDs of the user; with an oidc IdP, the value of its subject claim (BYWARD_OIDC_SUBJECT_CLAIM, default sub; a sub is at most 255 printable ASCII characters), as the audit records' user_key shows it` + "\n"},
 		{"revoke-user with an empty key", []string{"revoke-user", ""}, noStore, exitConfig, "", `byward: revoke-user (0 characters, not shown): not a user key: with Entra, tid:oid, the tenant and object IDs of the user; with an oidc IdP, the value of its subject claim (BYWARD_OIDC_SUBJECT_CLAIM, default sub; a sub is at most 255 printable ASCII characters), as the audit records' user_key shows it` + "\n"},
@@ -473,7 +473,7 @@ func TestRevokeUserHelpPrintsUsageAndExits0(t *testing.T) {
 	}
 }
 
-func TestRevokeUserWithOIDC(t *testing.T) {
+func TestRevokeUserTakesAnyKeyAfterKeyEqualsUnderOIDCAndNeverAKeyAfterDashes(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		args   []string
